@@ -1,0 +1,91 @@
+import React from 'react';
+import htm from 'htm';
+
+export const html = htm.bind(React.createElement);
+
+export const thumb = (id, q = 'hqdefault') => `https://i.ytimg.com/vi/${id}/${q}.jpg`;
+export const watchUrl = (id, t = 0) => `https://www.youtube.com/watch?v=${id}${t > 5 ? `&t=${Math.floor(t)}s` : ''}`;
+
+// 秒 → 「12:34」「1:02:03」
+export function fmtTime(sec) {
+  sec = Math.max(0, Math.floor(Number(sec) || 0));
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${m}:${String(s).padStart(2, '0')}`;
+}
+
+// 回数 → 「12万 回視聴」
+export function fmtViews(n) {
+  n = Number(n) || 0;
+  if (!n) return '';
+  if (n >= 1e8) return `${trim1(n / 1e8)}億 回視聴`;
+  if (n >= 1e4) return `${trim1(n / 1e4)}万 回視聴`;
+  return `${n.toLocaleString('ja-JP')} 回視聴`;
+}
+const trim1 = (x) => (x >= 100 ? Math.round(x) : Math.round(x * 10) / 10).toString();
+
+// 日時 → 「3 時間前」
+export function ago(iso, now = Date.now()) {
+  if (!iso) return '';
+  const t = new Date(iso).getTime();
+  if (!t) return '';
+  const s = Math.max(0, (now - t) / 1000);
+  if (s < 60) return 'たった今';
+  if (s < 3600) return `${Math.floor(s / 60)} 分前`;
+  if (s < 86400) return `${Math.floor(s / 3600)} 時間前`;
+  if (s < 86400 * 7) return `${Math.floor(s / 86400)} 日前`;
+  if (s < 86400 * 30) return `${Math.floor(s / 86400 / 7)} 週間前`;
+  if (s < 86400 * 365) return `${Math.floor(s / 86400 / 30)} か月前`;
+  return `${Math.floor(s / 86400 / 365)} 年前`;
+}
+
+const WD = ['日', '月', '火', '水', '木', '金', '土'];
+export const fmtDay = (d) => `${d.getMonth() + 1}月${d.getDate()}日(${WD[d.getDay()]})`;
+
+// 「けさの便」: 毎朝 hour 時に、前の日の hour 時からの新着をひとまとめにする
+export function morningWindow(hour = 6, now = new Date()) {
+  const end = new Date(now);
+  end.setHours(hour, 0, 0, 0);
+  if (now < end) end.setDate(end.getDate() - 1);
+  const start = new Date(end);
+  start.setDate(start.getDate() - 1);
+  return { start, end };
+}
+
+export function clsx(...a) {
+  return a.filter(Boolean).join(' ');
+}
+
+// 説明文の URL と 時刻(1:23)を押せるように分ける
+export function splitDesc(text) {
+  const out = [];
+  const re = /(https?:\/\/[^\s<>"'）)」]+)|(?<![\d:])(\d{1,2}:\d{2}(?::\d{2})?)(?![\d:])/g;
+  let last = 0;
+  let m;
+  while ((m = re.exec(text))) {
+    if (m.index > last) out.push({ t: 'text', v: text.slice(last, m.index) });
+    if (m[1]) out.push({ t: 'url', v: m[1] });
+    else out.push({ t: 'time', v: m[2], sec: m[2].split(':').map(Number).reduce((a, x) => a * 60 + x, 0) });
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) out.push({ t: 'text', v: text.slice(last) });
+  return out;
+}
+
+export function lsGetJson(k, fallback) {
+  try {
+    const v = localStorage.getItem(k);
+    return v ? JSON.parse(v) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+export function lsSetJson(k, v) {
+  try {
+    localStorage.setItem(k, JSON.stringify(v));
+    return true;
+  } catch {
+    return false;
+  }
+}

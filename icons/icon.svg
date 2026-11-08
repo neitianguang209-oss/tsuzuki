@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#a7746a"/>
+      <stop offset="1" stop-color="#7b4f4a"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" fill="url(#bg)"/>
+  <!-- 主役: クリーム色の再生ボタン(角を丸めた三角) -->
+  <path d="M410 300 Q380 282 380 318 L380 642 Q380 678 410 660 L690 498 Q718 480 690 462 Z" fill="#f6ecdc" stroke="#f6ecdc" stroke-width="44" stroke-linejoin="round"/>
+  <!-- 下に「途中まで」の細い線 -->
+  <rect x="262" y="782" width="500" height="22" rx="11" fill="#f6ecdc" opacity="0.32"/>
+  <rect x="262" y="782" width="300" height="22" rx="11" fill="#f6ecdc"/>
+  <circle cx="562" cy="793" r="26" fill="#f6ecdc"/>
+</svg>
