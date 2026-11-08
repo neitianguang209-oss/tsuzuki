@@ -72,12 +72,32 @@ function saveCache() {
 }
 
 // ------------------------------------------------------------------ 読み込み
-export async function load({ quiet = false } = {}) {
+let loading = null; // 読み込み中の Promise
+let mutSeq = 0; // 端末で「あとで見る・興味なし・登録」を変えた回数(読み込み中に変えたら、届いた古い一覧で巻き戻さない)
+const deletedNow = new Set(); // このあいだ履歴から消したもの(通信中の読み込みで復活させない)
+
+// 読み込み中なら終わるまで(長くても ms まで)待つ
+export function whenLoaded(ms = 3000) {
+  if (!loading) return Promise.resolve();
+  return Promise.race([loading.catch(() => {}), new Promise((r) => setTimeout(r, ms))]);
+}
+
+// 戻り値: 'ok' | 'bad'(合言葉がちがう) | 'error'(通信できない等) | 'nokey'
+export function load(opts = {}) {
+  // after: 今の読み込みが終わってから、もう一度読み込む(登録や取り込みの直後は新しい内容が要る)
+  if (loading) return opts.after ? loading.then(() => load({ ...opts, after: false })) : loading;
+  loading = doLoad(opts).finally(() => {
+    loading = null;
+  });
+  return loading;
+}
+async function doLoad({ quiet = false } = {}) {
   if (!getKey()) {
     setState({ needKey: true, booted: true });
-    return;
+    return 'nokey';
   }
   if (!quiet) setState({ syncing: true });
+  const seq = mutSeq;
   try {
     const d = await rpc('load', { days: 60 });
     // 安全弁: クラウドが空で端末に控えがあるときは、控えを消さない
@@ -87,11 +107,10 @@ export async function load({ quiet = false } = {}) {
     if (cloudEmpty && localHas) {
       setState({ progress, syncing: false, booted: true, needKey: false, error: 'クラウドの登録チャンネルが空でした。端末の控えを表示しています', offline: false });
     } else {
+      const touched = seq !== mutSeq; // 読み込みの間に端末で変えたものがある
       setState({
-        channels: d.channels || [],
-        videos: d.videos || [],
-        later: d.later || [],
-        hidden: new Set(d.hidden || []),
+        ...(touched ? {} : { channels: d.channels || [], later: d.later || [], hidden: new Set(d.hidden || []) }),
+        videos: touched ? (d.videos || []).filter((v) => state.channels.some((c) => c.id === v.ch)) : d.videos || [],
         progress,
         loadedAt: Date.now(),
         syncing: false,
@@ -104,9 +123,11 @@ export async function load({ quiet = false } = {}) {
     }
     flushProgress();
     autoRefresh(d.channels || []);
+    return 'ok';
   } catch (e) {
     const bad = e.status === 400 && /合言葉/.test(e.message);
     setState({ syncing: false, booted: true, needKey: bad || state.needKey, error: bad ? '' : e.message, offline: e.status === 0 });
+    return bad ? 'bad' : 'error';
   }
 }
 
@@ -121,7 +142,7 @@ async function autoRefresh(channels) {
   setState({ refreshing: true });
   try {
     const r = await fn('refresh', { n: 40, meta: 6 }, 60000);
-    if (r.added || r.filled) await load({ quiet: true });
+    if (r.added || r.filled) await load({ quiet: true, after: true });
     if (r.added) toast(`新しい動画が ${r.added} 本届きました`);
   } catch (_) {
     /* 次に開いたとき */
@@ -136,7 +157,7 @@ export async function refreshFeed() {
   setState({ refreshing: true });
   try {
     const r = await fn('refresh', { n: 40, meta: 6 }, 60000);
-    await load({ quiet: true });
+    await load({ quiet: true, after: true });
     toast(r.added ? `新しい動画が ${r.added} 本あります` : '新しい動画はありませんでした');
   } catch (e) {
     toast(`更新できませんでした(${e.message})`);
@@ -150,7 +171,15 @@ function mergeProgress(cloud) {
   const local = state.progress;
   const out = { ...local };
   const dirty = new Set(lsGetJson(DIRTY, []));
+  // ほかの端末で履歴から消したもの: クラウドに無く、まだ送っていない変更でもないものは端末からも消す。
+  // クラウドは新しい順に800件までしか返さないので、それより古いものは消さない
+  const inCloud = new Set(cloud.map((c) => c.id));
+  const oldestCloud = cloud.length >= 800 ? Math.min(...cloud.map((c) => new Date(c.at).getTime())) : 0;
+  for (const id of Object.keys(out)) {
+    if (!inCloud.has(id) && !dirty.has(id) && new Date(out[id].at || 0).getTime() >= oldestCloud) delete out[id];
+  }
   for (const c of cloud) {
+    if (deletedNow.has(c.id)) continue;
     const l = local[c.id];
     if (!l || (!dirty.has(c.id) && new Date(c.at) >= new Date(l.at || 0)) || new Date(c.at) > new Date(l.at || 0)) {
       out[c.id] = { pos: c.pos, dur: c.dur, done: c.done, title: c.title, ch: c.ch, cht: c.cht, at: c.at };
@@ -182,8 +211,14 @@ export function setProgress(id, patch, { flush = false } = {}) {
 }
 
 let flushing = null;
+let flushAgain = false;
 export async function flushProgress() {
-  if (flushing || !getKey()) return flushing;
+  if (!getKey()) return;
+  if (flushing) {
+    // 送っている途中に来た依頼は捨てず、終わったらもう一度送る(画面を閉じた瞬間の最後の位置のため)
+    flushAgain = true;
+    return flushing;
+  }
   const dirty = lsGetJson(DIRTY, []);
   if (!dirty.length) return;
   lsSetJson(PROG, trimProgress(state.progress));
@@ -199,6 +234,10 @@ export async function flushProgress() {
       /* 次の機会に送る */
     } finally {
       flushing = null;
+      if (flushAgain) {
+        flushAgain = false;
+        flushProgress();
+      }
     }
   })();
   return flushing;
@@ -211,6 +250,7 @@ document.addEventListener('visibilitychange', () => {
 });
 
 export async function deleteHistory(id) {
+  deletedNow.add(id);
   const p = { ...state.progress };
   delete p[id];
   setState({ progress: p });
@@ -234,6 +274,7 @@ export async function toggleLater(v) {
   // v は videoInfo() と同じ形 { id, title, chId, cht, dur }
   const item = { id: v.id, title: v.title || '', ch: v.chId || '', cht: v.cht || '', dur: v.dur || null, at: new Date().toISOString() };
   const later = has ? state.later.filter((l) => l.id !== v.id) : [item, ...state.later];
+  mutSeq++;
   setState({ later });
   saveCache();
   toast(has ? '「あとで見る」から外しました' : '「あとで見る」に入れました');
@@ -247,6 +288,7 @@ export async function toggleLater(v) {
 export async function hideVideo(id, undo = false) {
   const hidden = new Set(state.hidden);
   undo ? hidden.delete(id) : hidden.add(id);
+  mutSeq++;
   setState({ hidden });
   saveCache();
   try {
@@ -260,11 +302,12 @@ export const isSubscribed = (chId) => state.channels.some((c) => c.id === chId);
 
 export async function subscribeChannel(ch) {
   const temp = { id: ch.id, title: ch.title || '', avatar: ch.avatar || '', handle: ch.handle || '' };
+  mutSeq++;
   setState({ channels: [...state.channels.filter((c) => c.id !== ch.id), temp] });
   toast('登録しました。新着を取り込んでいます…');
   try {
     await fn('sub', { id: ch.id, title: ch.title, avatar: ch.avatar, handle: ch.handle }, 60000);
-    await load({ quiet: true });
+    await load({ quiet: true, after: true });
   } catch (e) {
     setState({ channels: state.channels.filter((c) => c.id !== ch.id) });
     toast(`登録できませんでした(${e.message})`);
@@ -273,19 +316,22 @@ export async function subscribeChannel(ch) {
 
 export async function subscribeByUrl(url) {
   const r = await fn('sub', { url }, 60000);
-  await load({ quiet: true });
+  await load({ quiet: true, after: true });
   return r.channel;
 }
 
 export async function unsubscribeChannel(id) {
   const before = state.channels;
+  const beforeVideos = state.videos;
+  mutSeq++;
   setState({ channels: before.filter((c) => c.id !== id), videos: state.videos.filter((v) => v.ch !== id) });
   saveCache();
   try {
     await rpc('unsub', { id });
     toast('登録を解除しました');
   } catch (e) {
-    setState({ channels: before });
+    setState({ channels: before, videos: beforeVideos });
+    saveCache();
     toast(`解除できませんでした(${e.message})`);
   }
 }

@@ -43,17 +43,26 @@ self.addEventListener('fetch', (event) => {
   // 同じ github.io にあるほかのアプリには手を出さない
   if (!req.url.startsWith(self.registration.scope)) return;
 
-  // アプリ本体: まず手元の控えを出し、裏で新しいものに入れ替えておく
-  event.respondWith(
-    caches.match(req, { ignoreSearch: req.mode === 'navigate' }).then((cached) => {
-      const fresh = fetch(req).then((res) => {
-        if (res && res.ok) {
-          const clone = res.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(req, clone));
-        }
-        return res;
-      }).catch(() => cached || (req.mode === 'navigate' ? caches.match(INDEX_URL) : undefined));
-      return cached || fresh;
-    })
-  );
+  // アプリ本体: 通信できるときはいつも新しいものを取り(新旧のファイルが混ざらないように)、
+  // 通信できないときや遅いときだけ手元の控えを出す
+  event.respondWith((async () => {
+    const cache = await caches.open(CACHE_NAME);
+    const net = fetch(req, { cache: 'no-cache' }).then((res) => {
+      if (res && res.ok) cache.put(req, res.clone());
+      return res;
+    });
+    event.waitUntil(net.catch(() => {}));
+    const timeout = new Promise((r) => setTimeout(r, 4000));
+    try {
+      const res = await Promise.race([net, timeout]);
+      if (res) return res;
+    } catch (_) { /* 通信できない */ }
+    const hit = await cache.match(req, { ignoreSearch: req.mode === 'navigate' });
+    if (hit) return hit;
+    if (req.mode === 'navigate') {
+      const idx = await cache.match(INDEX_URL);
+      if (idx) return idx;
+    }
+    return net;
+  })());
 });

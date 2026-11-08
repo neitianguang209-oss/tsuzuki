@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { html, thumb, watchUrl, fmtTime, fmtViews, ago, fmtDay, morningWindow, clsx, splitDesc, lsGetJson, lsSetJson } from './util.js';
+import { html, thumb, watchUrl, fmtTime, fmtViews, ago, fmtDay, morningWindow, clsx, splitDesc, lsGetJson, lsSetJson, goBack } from './util.js';
 import {
   useStore, getState, setState, toast, setPref, load, refreshFeed, toggleLater, isLater, hideVideo, deleteHistory,
   subscribeChannel, subscribeByUrl, unsubscribeChannel, exportData, videoInfo, videoDetail, rememberDetail, rememberHits, chById,
@@ -115,10 +115,11 @@ function VideoCard({ v, queue, variant = 'big', menu = true, extra }) {
 }
 
 // 少しずつ表示を足す一覧
-function Paged({ items, render, step = 24 }) {
+// resetKey が変わったとき(絞り込みを替えたとき)だけ先頭の件数に戻す。再生中の描き直しでは戻さない
+function Paged({ items, render, step = 24, resetKey = '' }) {
   const [n, setN] = useState(step);
   const ref = useRef(null);
-  useEffect(() => setN(step), [items, step]);
+  useEffect(() => setN(step), [resetKey, step]);
   useEffect(() => {
     if (!ref.current || n >= items.length) return;
     const io = new IntersectionObserver((es) => {
@@ -188,7 +189,7 @@ export function TopBar({ route }) {
   if (route.name === 'search') return null;
   if (!main) {
     return html`<header class="top">
-      <button class="ib" aria-label="戻る" onClick=${() => (history.length > 1 ? history.back() : (location.hash = '#/'))}><${Icon} d=${I.back} /></button>
+      <button class="ib" aria-label="戻る" onClick=${goBack}><${Icon} d=${I.back} /></button>
       <div class="top-title">${route.title || ''}</div>
       <span class="sp"></span>
       <button class="ib" aria-label="検索" onClick=${() => (location.hash = '#/s/')}><${Icon} d=${I.search} /></button>
@@ -272,7 +273,7 @@ export function Home() {
     ${chip === 'morning' && html`<div class="morning-head">${fmtDay(end)} ${prefs.morningHour}時の便 ・ ${fmtDay(start).replace(/\(.\)/, '')} ${prefs.morningHour}時から届いた ${morning.length} 本</div>`}
     ${list.length === 0
       ? html`<${Empty}>${chip === 'continue' ? '途中まで見た動画はありません' : chip === 'morning' ? 'けさの便に入った動画はありません' : '動画がありません'}</${Empty}>`
-      : html`<div class="grid"><${Paged} items=${list} render=${(v) => html`<${VideoCard} key=${v.id} v=${v} queue=${ids} />`} /></div>`}
+      : html`<div class="grid"><${Paged} items=${list} resetKey=${chip} render=${(v) => html`<${VideoCard} key=${v.id} v=${v} queue=${ids} />`} /></div>`}
   </div>`;
 }
 
@@ -322,7 +323,7 @@ export function Subs({ chId }) {
     ${sel && html`<div class="sel-ch"><b>${sel.title}</b><span class="sp"></span><a class="btn sm ghost" href=${`#/c/${sel.id}`}>チャンネルを見る</a></div>`}
     ${list.length === 0
       ? html`<${Empty}>動画がありません</${Empty}>`
-      : html`<div class="grid"><${Paged} items=${list} render=${(v) => html`<${VideoCard} key=${v.id} v=${v} queue=${ids} />`} /></div>`}
+      : html`<div class="grid"><${Paged} items=${list} resetKey=${chId || 'all'} render=${(v) => html`<${VideoCard} key=${v.id} v=${v} queue=${ids} />`} /></div>`}
   </div>`;
 }
 
@@ -425,6 +426,8 @@ export function ChannelPage({ id }) {
   const [data, setData] = useState(() => chCache.get(key) || null);
   const [err, setErr] = useState('');
   const [more, setMore] = useState(false);
+  const keyRef = useRef(key);
+  keyRef.current = key;
   useEffect(() => {
     let off = false;
     setErr('');
@@ -447,13 +450,14 @@ export function ChannelPage({ id }) {
   const ids = vids.filter((v) => !v.live).map((v) => v.id);
   const loadMore = async () => {
     if (!data?.cont) return;
+    const myKey = key;
     setMore(true);
     try {
       const d = await fn('channel', { id, cont: data.cont });
       rememberHits(d.videos);
       const nd = { ...data, videos: [...data.videos, ...d.videos.filter((v) => !data.videos.some((x) => x.id === v.id))], cont: d.cont };
-      chCache.set(key, nd);
-      setData(nd);
+      chCache.set(myKey, nd);
+      if (keyRef.current === myKey) setData(nd); // 途中でタブを替えていたら、今の画面には入れない
     } catch (e) {
       toast(e.message);
     } finally {
@@ -494,6 +498,8 @@ export function Search({ q: q0 }) {
   const inputRef = useRef(null);
   useEffect(() => {
     setQ(q0 || '');
+    setBusy(false);
+    setErr('');
     if (!q0) {
       setData(null);
       setTimeout(() => inputRef.current?.focus(), 50);
@@ -516,7 +522,9 @@ export function Search({ q: q0 }) {
       })
       .catch((e) => !off && setErr(e.message))
       .finally(() => !off && setBusy(false));
-    return () => { off = true; };
+    return () => {
+      off = true;
+    };
   }, [q0]);
   const submit = (e) => {
     e.preventDefault();
@@ -547,7 +555,7 @@ export function Search({ q: q0 }) {
   const ids = vids.filter((v) => !v.live).map((v) => v.id);
   return html`<div class="page">
     <form class="top search-top" onSubmit=${submit}>
-      <button type="button" class="ib" aria-label="戻る" onClick=${() => (history.length > 1 ? history.back() : (location.hash = '#/'))}><${Icon} d=${I.back} /></button>
+      <button type="button" class="ib" aria-label="戻る" onClick=${goBack}><${Icon} d=${I.back} /></button>
       <input ref=${inputRef} class="field search-field" type="search" enterkeyhint="search" placeholder="YouTube を検索" value=${q} onInput=${(e) => setQ(e.target.value)} />
       <button class="ib" aria-label="検索"><${Icon} d=${I.search} /></button>
     </form>
@@ -580,7 +588,8 @@ export function Watch({ id }) {
   useEffect(() => {
     const q = nextQueue;
     nextQueue = null;
-    P.load(id, q ? { queue: q } : { queue: [] });
+    // 一覧から開いたときだけ、その一覧を「続けて再生する順番」にする(自動で次へ・小さい窓から戻ったときは今の順番のまま)
+    P.load(id, q ? { queue: q } : {});
     scrollTo(0, 0);
     setOpen(false);
     setErr('');
@@ -690,7 +699,7 @@ export function Me() {
       </label>
       <label class="li"><span>いつもの再生速度</span><span class="sp"></span>
         <select value=${prefs.rate} onChange=${(e) => setPref('rate', Number(e.target.value))}>
-          ${[0.75, 1, 1.25, 1.5, 1.75, 2].map((r) => html`<option key=${r} value=${r}>${r === 1 ? '標準' : r + 'x'}</option>`)}
+          ${[0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map((r) => html`<option key=${r} value=${r}>${r === 1 ? '標準' : r + 'x'}</option>`)}
         </select>
       </label>
     </div>
@@ -754,11 +763,13 @@ export function KeyGate() {
     setBusy(true);
     setMsg('');
     setKey(k.trim());
-    await load();
+    const r = await load();
     setBusy(false);
-    if (getState().needKey) {
+    if (r === 'bad') {
       setKey('');
       setMsg('合言葉がちがうようです');
+    } else if (r === 'error') {
+      setMsg(`つながりませんでした(${getState().error || '通信エラー'})。もう一度「はじめる」を押してください`);
     }
   };
   return html`<div class="gate">

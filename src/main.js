@@ -1,17 +1,24 @@
 import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { html } from './util.js';
+import { html, noteRoute } from './util.js';
 import { takeKeyFromUrl } from './api.js';
 import { useStore, load, getState } from './store.js';
-import { PlayerShell, setMode, getPs } from './player.js';
+import { PlayerShell, setMode, getPs, close as closePlayer } from './player.js';
 import { TopBar, BottomNav, Home, Subs, Channels, AddChannel, ChannelPage, Search, Watch, Me, HistoryPage, LaterPage, KeyGate, Sheet } from './views.js';
 
 window.TZ_VERSION = '1.0.0';
 takeKeyFromUrl();
 
+function dec(x) {
+  try {
+    return decodeURIComponent(x);
+  } catch (_) {
+    return x; // 壊れた % があっても画面が真っ白にならないように
+  }
+}
 function parse(hash) {
-  const h = decodeURIComponent((hash || '').replace(/^#/, '')) || '/';
-  const seg = h.split('/').filter(Boolean);
+  const h = (hash || '').replace(/^#/, '') || '/';
+  const seg = h.split('/').filter(Boolean).map(dec);
   const [a, b] = seg;
   if (!a) return { name: 'home', tab: 'home' };
   if (a === 'w' && b) return { name: 'watch', id: b };
@@ -29,7 +36,11 @@ function parse(hash) {
 function useRoute() {
   const [r, setR] = useState(() => parse(location.hash));
   useEffect(() => {
-    const on = () => setR(parse(location.hash));
+    noteRoute(location.hash || '#/', location.hash.startsWith('#/w/'));
+    const on = () => {
+      noteRoute(location.hash || '#/', location.hash.startsWith('#/w/'));
+      setR(parse(location.hash));
+    };
     addEventListener('hashchange', on);
     return () => removeEventListener('hashchange', on);
   }, []);
@@ -52,13 +63,16 @@ function App() {
   // 再生画面を離れたら、プレーヤーは小さい窓になる
   useEffect(() => {
     if (route.name !== 'watch' && getPs().id) setMode('mini');
-    document.body.dataset.route = route.name;
-  }, [route.name]);
-
-  if (needKey) return html`<${KeyGate} />`;
+    document.body.dataset.route = needKey ? 'gate' : route.name;
+  }, [route.name, needKey]);
+  // 合言葉の画面に入るときは、流していた動画を止める(プレーヤーの箱は外さない)
+  useEffect(() => {
+    if (needKey && getPs().id) closePlayer();
+  }, [needKey]);
 
   let page;
-  switch (route.name) {
+  switch (needKey ? 'gate' : route.name) {
+    case 'gate': page = html`<${KeyGate} />`; break;
     case 'watch': page = html`<${Watch} id=${route.id} />`; break;
     case 'subs': page = html`<${Subs} chId=${route.chId} />`; break;
     case 'channels': page = html`<${Channels} />`; break;
@@ -72,11 +86,11 @@ function App() {
   }
   const title = route.name === 'channel' ? routeTitle || 'チャンネル' : route.title;
   return html`<div class="app">
-    <${TopBar} route=${{ ...route, title }} />
-    ${offline && html`<div class="offline">オフラインです。前回の内容を表示しています</div>`}
-    <main class="main">${!booted && !getState().channels.length ? html`<div class="loading">読み込み中…</div>` : page}</main>
+    ${!needKey && html`<${TopBar} route=${{ ...route, title }} />`}
+    ${offline && !needKey && html`<div class="offline">オフラインです。前回の内容を表示しています</div>`}
+    <main class="main">${!needKey && !booted && !getState().channels.length ? html`<div class="loading">読み込み中…</div>` : page}</main>
     <${PlayerShell} />
-    <${BottomNav} route=${route} />
+    ${!needKey && html`<${BottomNav} route=${route} />`}
     <${Sheet} />
     <${Toast} />
   </div>`;

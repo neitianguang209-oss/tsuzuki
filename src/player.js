@@ -1,8 +1,8 @@
 // 動画プレーヤー: YouTube 公式の埋め込み(iframe API)を1つだけ作り、画面を移っても使い回す(小さい再生窓になる)。
 // 広告や動画そのものには手を加えない。こちらが行うのは、操作ボタン・続きからの再開・字幕を出さない設定だけ。
 import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { html, fmtTime, watchUrl, clsx } from './util.js';
-import { getState as appState, setProgress, flushProgress, videoInfo, videoDetail, toast, setPref } from './store.js';
+import { html, fmtTime, watchUrl, clsx, leaveWatch } from './util.js';
+import { getState as appState, setProgress, flushProgress, videoInfo, videoDetail, toast, setPref, whenLoaded } from './store.js';
 
 // ------------------------------------------------------------------ プレーヤーの状態(アプリの状態とは別。0.5秒ごとに変わるため)
 let ps = {
@@ -16,7 +16,7 @@ let ps = {
   manualPass: false, // 本人が「YouTube の操作」に切りかえたか
   fs: false,
   error: '',
-  upNext: null, // { id, title, until }
+  upNext: null, // { id, ms }(終わったあと、次の動画へ進むまでの待ち)
   queue: [],
   rate: 1,
   ready: false,
@@ -61,7 +61,9 @@ function loadApi() {
 
 let player = null; // YT.Player
 let hostEl = null; // iframe を入れる箱(React の外で作る)
-let pending = null; // プレーヤーができる前に頼まれた { id, start }
+let want = null; // プレーヤーの準備ができる前に頼まれた、いちばん新しい { id, start }(閉じたら null)
+let creating = null; // プレーヤーを作っている途中の Promise
+let createdId = ''; // プレーヤーを作ったときの動画
 let lastSaved = 0;
 let captionsOffFor = '';
 
@@ -89,55 +91,87 @@ export function resumePoint(id) {
   return Math.max(0, pos - 2);
 }
 
-async function create(id, start) {
-  const YT = await loadApi();
-  if (player) return;
-  const div = document.createElement('div');
-  hostEl.innerHTML = '';
-  hostEl.appendChild(div);
-  player = new YT.Player(div, {
-    host: 'https://www.youtube-nocookie.com',
-    videoId: id,
-    width: '100%',
-    height: '100%',
-    playerVars: {
-      autoplay: 1,
-      playsinline: 1,
-      controls: 0,
-      rel: 0,
-      fs: 0,
-      disablekb: 1,
-      iv_load_policy: 3,
-      cc_load_policy: 0,
-      cc_lang_pref: 'ja',
-      hl: 'ja',
-      start: Math.floor(start || 0),
-      origin: location.origin,
-      enablejsapi: 1,
-    },
-    events: {
-      onReady: () => {
-        setPs({ ready: true });
-        noCaptions();
-        try { player.setPlaybackRate(appState().prefs.rate || 1); } catch (_) { /* 速さを変えられない動画 */ }
-        if (pending) {
-          const p = pending;
-          pending = null;
-          if (p.id !== id) player.loadVideoById({ videoId: p.id, startSeconds: p.start });
-        }
-        try { player.playVideo(); } catch (_) { /* iPhone は最初はタップが要る */ }
+function create() {
+  if (creating || player) return creating;
+  creating = (async () => {
+    let YT;
+    try {
+      YT = await loadApi();
+    } catch (e) {
+      setPs({ error: e.message });
+      return;
+    } finally {
+      creating = null;
+    }
+    // 待っている間に別の動画が選ばれた・閉じられたときは、いちばん新しい指示に従う
+    const w = want;
+    if (player || !w || !ps.id || !hostEl) return;
+    want = null;
+    createdId = w.id;
+    const div = document.createElement('div');
+    hostEl.innerHTML = '';
+    hostEl.appendChild(div);
+    player = new YT.Player(div, {
+      host: 'https://www.youtube-nocookie.com',
+      videoId: w.id,
+      width: '100%',
+      height: '100%',
+      playerVars: {
+        autoplay: 1,
+        playsinline: 1,
+        controls: 0,
+        rel: 0,
+        fs: 0,
+        disablekb: 1,
+        iv_load_policy: 3,
+        cc_load_policy: 0,
+        cc_lang_pref: 'ja',
+        hl: 'ja',
+        start: Math.floor(w.start || 0),
+        origin: location.origin,
+        enablejsapi: 1,
       },
-      onStateChange: (e) => onState(e.data),
-      onError: (e) => onError(e.data),
-      onApiChange: () => noCaptions(),
-      onPlaybackRateChange: (e) => setPs({ rate: e.data }),
-    },
-  });
+      events: {
+        onReady: () => {
+          setPs({ ready: true });
+          noCaptions();
+          try { player.setPlaybackRate(appState().prefs.rate || 1); } catch (_) { /* 速さを変えられない動画 */ }
+          const w2 = want;
+          want = null;
+          if (!ps.id) {
+            try { player.stopVideo(); } catch (_) { /* 閉じたあと */ }
+            return;
+          }
+          if (w2 && w2.id !== createdId) player.loadVideoById({ videoId: w2.id, startSeconds: w2.start });
+          else {
+            try { player.playVideo(); } catch (_) { /* iPhone は最初はタップが要る */ }
+          }
+        },
+        onStateChange: (e) => onState(e.data),
+        onError: (e) => onError(e.data),
+        onApiChange: () => noCaptions(),
+        onPlaybackRateChange: (e) => setPs({ rate: e.data }),
+      },
+    });
+  })();
+  return creating;
+}
+
+// 画面から外れた古い箱に入ったプレーヤーは捨てて、新しい箱で作り直す
+function ensureAlive() {
+  if (!player || !hostEl) return;
+  let iframe = null;
+  try { iframe = player.getIframe?.(); } catch (_) { /* 壊れている */ }
+  if (iframe && hostEl.contains(iframe)) return;
+  try { player.destroy(); } catch (_) { /* 何もしない */ }
+  player = null;
+  setPs({ ready: false, st: -1 });
 }
 
 function onState(st) {
   const patch = { st, buffering: st === 3 };
   if (st === 1) {
+    if (ps.upNext) clearNext();
     if (!ps.started) {
       patch.started = true;
       if (!ps.manualPass) patch.pass = false;
@@ -157,7 +191,8 @@ function onState(st) {
   if (st === 2) saveNow(true);
   if (st === 0) {
     saveNow(true, true);
-    scheduleNext();
+    // 小さい窓で流しているときは、勝手に再生画面へ移らない
+    if (ps.mode === 'full' || ps.fs) scheduleNext();
   }
 }
 
@@ -185,8 +220,15 @@ function saveNow(flush = false, ended = false) {
     return;
   }
   if (!d || t < 1) return;
+  // 動画を切りかえた直後は、前の動画の時間がまだ返ってくるので記録しない
+  try {
+    const vd = player.getVideoData?.();
+    if (!vd || vd.video_id !== ps.id) return;
+  } catch (_) {
+    return;
+  }
   const info = videoInfo(ps.id);
-  const done = ended || d - t <= Math.max(10, Math.min(30, d * 0.03));
+  const done = ended || d - t <= Math.min(30, Math.max(2, d * 0.05));
   setProgress(ps.id, { pos: Math.round(t), dur: Math.round(d), done, title: info.title || undefined, ch: info.chId || undefined, cht: info.cht || undefined }, { flush });
   lastSaved = Date.now();
 }
@@ -212,29 +254,23 @@ addEventListener('pagehide', () => saveNow(true));
 export async function load(id, { queue } = {}) {
   if (!id) return;
   if (queue) setPs({ queue });
-  if (ps.id === id) {
+  ensureAlive();
+  if (ps.id === id && (player || creating || want)) {
     if (ps.mode !== 'full') setPs({ mode: 'full' });
     return;
   }
   if (ps.id) saveNow(true);
-  const start = resumePoint(id);
   clearNext();
   captionsOffFor = '';
-  setPs({ id, mode: 'full', st: -1, time: start, dur: videoInfo(id).dur || 0, error: '', live: false, upNext: null });
-  if (!player) {
-    if (!hostEl) {
-      pending = { id, start };
-      return;
-    }
-    try {
-      await create(id, start);
-    } catch (e) {
-      setPs({ error: e.message });
-    }
-    return;
-  }
-  if (!ps.ready) {
-    pending = { id, start };
+  setPs({ id, mode: 'full', st: -1, time: 0, dur: videoInfo(id).dur || 0, error: '', live: false, upNext: null });
+  // 別の端末で見た位置が届く前に始めると、古い位置から流して上書きしてしまうので、読み込み中なら少し待つ
+  await whenLoaded(3500);
+  if (ps.id !== id) return; // 待っている間に別の動画が選ばれた
+  const start = resumePoint(id);
+  setPs({ time: start });
+  if (!player || !ps.ready) {
+    want = { id, start };
+    if (!player) create();
     return;
   }
   player.loadVideoById({ videoId: id, startSeconds: start });
@@ -250,6 +286,7 @@ export function setMode(mode) {
 export function close() {
   saveNow(true);
   clearNext();
+  want = null;
   try { player?.stopVideo(); } catch (_) { /* 何もしない */ }
   if (ps.fs) exitFs();
   setPs({ id: '', mode: 'none', st: -1, time: 0, dur: 0, error: '', upNext: null });
@@ -257,6 +294,7 @@ export function close() {
 
 export function togglePlay() {
   if (!player) return;
+  if (ps.upNext) clearNext();
   try {
     if (ps.st === 1 || ps.st === 3) player.pauseVideo();
     else player.playVideo();
@@ -266,6 +304,7 @@ export function seekTo(sec) {
   if (!player) return;
   const d = ps.dur || player.getDuration?.() || 0;
   const t = Math.max(0, d ? Math.min(sec, d - 0.5) : sec);
+  if (ps.upNext) clearNext();
   try {
     player.seekTo(t, true);
     setPs({ time: t });
@@ -326,8 +365,7 @@ function scheduleNext() {
   if (!appState().prefs.autoNext) return;
   const id = nextCandidate();
   if (!id) return;
-  const until = Date.now() + 6000;
-  setPs({ upNext: { id, until } });
+  setPs({ upNext: { id, ms: 6000 } });
   clearTimeout(nextTimer);
   nextTimer = setTimeout(() => {
     if (ps.upNext?.id === id) playNext();
@@ -344,7 +382,7 @@ export function cancelNext() {
 
 // ------------------------------------------------------------------ キーボード(パソコン)
 addEventListener('keydown', (e) => {
-  if (!ps.id || ps.mode === 'none') return;
+  if (!ps.id || (ps.mode !== 'full' && !ps.fs)) return;
   const tag = (e.target?.tagName || '').toLowerCase();
   if (tag === 'input' || tag === 'textarea' || e.target?.isContentEditable || e.ctrlKey || e.metaKey || e.altKey) return;
   const k = e.key;
@@ -356,7 +394,7 @@ addEventListener('keydown', (e) => {
   else if (k === 'f') (ps.fs ? exitFs() : enterFs());
   else if (k === 'Escape' && ps.fs) exitFs();
   else if (k === '>' ) setRate(Math.min(2, (ps.rate || 1) + 0.25));
-  else if (k === '<') setRate(Math.max(0.25, (ps.rate || 1) - 0.25));
+  else if (k === '<') setRate(Math.max(0.5, (ps.rate || 1) - 0.25));
   else return;
   e.preventDefault();
 });
@@ -397,6 +435,15 @@ function Controls() {
   const [show, setShow] = useState(true);
   const [menu, setMenu] = useState(false);
   const [drag, setDrag] = useState(null);
+  const dragRef = useRef(null);
+  // つまみを離したときに1回だけ飛ぶ(動かしている間は表示だけ変える)
+  const commitDrag = () => {
+    if (dragRef.current == null) return;
+    const v = dragRef.current;
+    dragRef.current = null;
+    seekTo(v);
+    setDrag(null);
+  };
   const [ripple, setRipple] = useState(null);
   const tapRef = useRef({ t: 0, timer: 0, x: 0 });
   const hideRef = useRef(0);
@@ -440,7 +487,7 @@ function Controls() {
         setShow(false);
         clearTimeout(hideRef.current);
       } else poke();
-    }, 260);
+    }, 300);
   };
 
   if (pass) {
@@ -474,11 +521,11 @@ function Controls() {
         <button class="btn ghost" onClick=${cancelNext}>キャンセル</button>
         <button class="btn" onClick=${playNext}>今すぐ再生</button>
       </div>
-      <div class="pc-next-bar" style=${{ animationDuration: Math.max(0, upNext.until - Date.now()) + 'ms' }}></div>
+      <div class="pc-next-bar" key=${upNext.id} style=${{ animationDuration: upNext.ms + 'ms' }}></div>
     </div>`}
     <div class="pc-shade"></div>
     <div class="pc-top">
-      ${!fs && html`<button class="pc-ib" aria-label="小さくする" onClick=${() => history.length > 1 ? history.back() : (location.hash = '#/')}><${Icon} d=${IC.down} size=${28} /></button>`}
+      ${!fs && html`<button class="pc-ib" aria-label="小さくする" onClick=${leaveWatch}><${Icon} d=${IC.down} size=${28} /></button>`}
       ${fs && html`<div class="pc-title">${videoInfo(id).title}</div>`}
       <span class="sp"></span>
       <button class="pc-chip" onClick=${() => setMenu(menu === 'rate' ? false : 'rate')}>${rate || 1}x</button>
@@ -511,9 +558,9 @@ function Controls() {
     ${!live &&
     html`<div class="pc-seek" style=${{ '--p': pct + '%' }}>
       <input type="range" min="0" max=${Math.max(1, Math.floor(dur))} step="1" value=${Math.floor(shown)} aria-label="再生位置"
-        onInput=${(e) => { setDrag(Number(e.target.value)); poke(); }}
-        onChange=${(e) => { seekTo(Number(e.target.value)); setDrag(null); }}
-        onPointerUp=${(e) => { if (drag != null) { seekTo(Number(e.target.value)); setDrag(null); } }} />
+        onInput=${(e) => { dragRef.current = Number(e.target.value); setDrag(dragRef.current); poke(); }}
+        onChange=${(e) => { dragRef.current = Number(e.target.value); setDrag(dragRef.current); }}
+        onPointerUp=${commitDrag} onTouchEnd=${commitDrag} onKeyUp=${commitDrag} onBlur=${commitDrag} />
     </div>`}
     <div class="pc-line" style=${{ width: pct + '%' }}></div>
   </div>`;
@@ -544,11 +591,13 @@ export function PlayerShell() {
   const hostRef = useRef(null);
   useEffect(() => {
     attachHost(hostRef.current);
-    if (pending && !player) {
-      const p = pending;
-      pending = null;
-      create(p.id, p.start).catch((e) => setPs({ error: e.message }));
+    // 箱が付き直したとき: 古いプレーヤーは捨て、頼まれていた動画があれば作る
+    ensureAlive();
+    if (!player && ps.id) {
+      if (!want) want = { id: ps.id, start: resumePoint(ps.id) };
+      create();
     }
+    return () => attachHost(null);
   }, []);
   return html`<div class=${clsx('ph', fs ? 'fs' : mode)} aria-hidden=${mode === 'none' ? 'true' : 'false'}>
     <div class="ph-video">

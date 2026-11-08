@@ -86,9 +86,10 @@ img { display: block; }
 .field {
   flex: 1; min-width: 0; height: 40px; padding: 0 14px; border-radius: 20px;
   border: 1px solid var(--line); background: var(--bg2); outline: none;
+  font-size: 16px; /* 16px より小さいと、iPhone で押すたびに画面が拡大される */
 }
 .field:focus { border-color: #3ea6ff; }
-select { height: 34px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg2); padding: 0 8px; }
+select { height: 34px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg2); padding: 0 8px; font-size: 16px; }
 
 /* ------------------------------------------------------------ 上のバー・下のタブ */
 .top {
@@ -309,9 +310,9 @@ body[data-route="watch"]::before { content: ''; position: fixed; left: 0; right:
 .pc-seek input::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: var(--red); border: 0; }
 .pc-line { position: absolute; left: 0; bottom: 0; height: 2px; background: var(--red); pointer-events: none; transition: opacity 0.2s; }
 .pc.on .pc-line { opacity: 0; }
-.ph.fs .pc-bottom { bottom: 26px; padding: 0 20px; }
-.ph.fs .pc-seek { bottom: 8px; left: 16px; right: 16px; }
-.ph.fs .pc-top { padding: max(8px, var(--sat)) 12px 8px; }
+.ph.fs .pc-bottom { bottom: calc(26px + var(--sab)); padding: 0 calc(20px + env(safe-area-inset-right, 0px)) 0 calc(20px + env(safe-area-inset-left, 0px)); }
+.ph.fs .pc-seek { bottom: calc(8px + var(--sab)); left: calc(16px + env(safe-area-inset-left, 0px)); right: calc(16px + env(safe-area-inset-right, 0px)); }
+.ph.fs .pc-top { padding: max(8px, var(--sat)) calc(12px + env(safe-area-inset-right, 0px)) 8px calc(12px + env(safe-area-inset-left, 0px)); }
 .pc-menu {
   position: absolute; right: 8px; top: 44px; z-index: 5; min-width: 220px; max-width: calc(100% - 16px); max-height: calc(100% - 52px); overflow: auto;
   background: rgba(28, 28, 28, 0.96); border-radius: 12px; padding: 6px 0; color: #fff;

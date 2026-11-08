@@ -277,6 +277,7 @@ async function resolveChannel(input: string): Promise<string> {
 }
 
 // ------------------------------------------------------------------ 新着フィード(RSS)
+const KEEP_DAYS = 200; // これより古い新着は持たない(定期の片づけと同じ日数)
 const ent = (s: string) =>
   s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
     .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)));
@@ -303,7 +304,7 @@ async function fetchFeed(chId: string) {
       is_short: /\/shorts\//.test(link),
       fetched_at: new Date().toISOString(),
     };
-  }).filter((v) => v.id);
+  }).filter((v) => v.id && (!v.published || Date.now() - new Date(v.published).getTime() < (KEEP_DAYS - 5) * 864e5));
   return { gone: false, title, items };
 }
 
@@ -350,8 +351,12 @@ async function fillMeta(maxChannels: number) {
   const { data: rows } = await db.from('tsuzuki_videos').select('id, channel_id, meta_tries')
     .is('duration', null).eq('is_short', false).lt('meta_tries', 3)
     .order('published', { ascending: false }).limit(400);
+  // 配信中・配信予定のものは、終わって長さが決まるまで見直す(1週間まで)
+  const { data: lives } = await db.from('tsuzuki_videos').select('id, channel_id, meta_tries')
+    .eq('is_live', true).gte('published', new Date(Date.now() - 7 * 864e5).toISOString())
+    .order('published', { ascending: false }).limit(40);
   const byCh = new Map<string, Any[]>();
-  for (const r of rows || []) {
+  for (const r of [...(lives || []), ...(rows || [])]) {
     if (!byCh.has(r.channel_id)) {
       if (byCh.size >= maxChannels) continue;
       byCh.set(r.channel_id, []);
@@ -368,8 +373,8 @@ async function fillMeta(maxChannels: number) {
         for (const h of p.videos) {
           const row = want.get(h.id);
           if (!row) continue;
-          const live = tab === 'streams' && (h.live || !h.dur);
-          await db.from('tsuzuki_videos').update({ duration: h.dur || 0, is_live: live || h.live }).eq('id', h.id);
+          const live = h.live || (tab === 'streams' && !h.dur);
+          await db.from('tsuzuki_videos').update({ duration: h.dur || 0, is_live: live }).eq('id', h.id);
           want.delete(h.id);
           filled++;
         }
@@ -413,7 +418,7 @@ async function subscribe(input: Any) {
 async function importChannels(list: Any[]) {
   const rows = (list || [])
     .map((c) => ({ id: String(c.id || '').match(/UC[\w-]{22}/)?.[0] || '', title: String(c.title || ''), avatar: c.avatar ? String(c.avatar) : null, handle: c.handle ? String(c.handle) : null }))
-    .filter((c) => c.id);
+    .filter((c, i, a) => c.id && a.findIndex((x) => x.id === c.id) === i);
   if (!rows.length) return { imported: 0 };
   const { data: had } = await db.from('tsuzuki_channels').select('id').in('id', rows.map((r) => r.id));
   const known = new Set((had || []).map((r: Any) => r.id));
@@ -479,7 +484,7 @@ Deno.serve(async (req) => {
         const r = await refresh(25, 10);
         const av = await fillAvatars(12);
         // 200日より前の新着は片づける(履歴・あとで見るは題名を自分で持っているので消えない)
-        const old = new Date(Date.now() - 200 * 864e5).toISOString();
+        const old = new Date(Date.now() - KEEP_DAYS * 864e5).toISOString();
         await db.from('tsuzuki_videos').delete().lt('published', old);
         return json({ ...r, avatars: av });
       }

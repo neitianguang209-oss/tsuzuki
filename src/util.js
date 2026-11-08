@@ -53,6 +53,28 @@ export function morningWindow(hour = 6, now = new Date()) {
   return { start, end };
 }
 
+// アプリの中で移った画面の並び(「戻る」でアプリの外へ出ないため)
+export const nav = { stack: [], lastNonWatch: '#/' };
+export function noteRoute(hash, isWatch) {
+  const h = hash || '#/';
+  const s = nav.stack;
+  if (s.length >= 2 && s[s.length - 2] === h) s.pop();
+  else if (s[s.length - 1] !== h) s.push(h);
+  if (s.length > 50) s.shift();
+  if (!isWatch) nav.lastNonWatch = h;
+}
+export function goBack() {
+  if (nav.stack.length > 1) history.back();
+  else location.hash = '#/';
+}
+// 再生画面を小さくする: ひとつ前が再生画面以外ならそこへ戻る。そうでなければ最後に見ていた一覧へ
+export function leaveWatch() {
+  const s = nav.stack;
+  const prev = s[s.length - 2];
+  if (prev && !prev.startsWith('#/w/')) history.back();
+  else location.hash = nav.lastNonWatch || '#/';
+}
+
 export function clsx(...a) {
   return a.filter(Boolean).join(' ');
 }
