@@ -1,7 +1,7 @@
 // 動画プレーヤー: YouTube 公式の埋め込み(iframe API)を1つだけ作り、画面を移っても使い回す(小さい再生窓になる)。
 // 広告や動画そのものには手を加えない。こちらが行うのは、操作ボタン・続きからの再開・字幕を出さない設定だけ。
 import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { html, fmtTime, watchUrl, clsx, leaveWatch } from './util.js';
+import { html, fmtTime, watchUrl, clsx, leaveWatch, lsSetJson, setThemeBlack } from './util.js';
 import { getState as appState, subscribe as subscribeApp, setProgress, flushProgress, videoInfo, videoDetail, toast, setPref, whenLoaded } from './store.js';
 
 // ------------------------------------------------------------------ プレーヤーの状態(アプリの状態とは別。0.5秒ごとに変わるため)
@@ -24,6 +24,13 @@ let ps = {
   buffering: false,
   autoPass: false, // 自動で始まらなかったので、動画を直接タップしてもらう状態
   userPaused: false,
+  sleepAt: 0, // おやすみタイマーが切れる時刻(0 = タイマーなし)
+  sleepLeft: 0, // あと何分か
+  sleepEnd: false, // 「この動画が終わるまで」
+  sleepMin: 0, // 選んだタイマー(0 / 分 / 'end')。設定の窓の ✓ に使う
+  sleepWarn: false, // まもなく止まる(1分前)
+  rotRev: (() => { try { return localStorage.getItem('tsuzuki:rotDir') === '-90'; } catch (_) { return false; } })(), // 回す向きを反対に
+  loadedAt: 0, // この動画を読み込んだ時刻(広告スキップの案内を出す間)
 };
 
 // iPhone・iPad か / ホーム画面のアイコンから開いているか
@@ -191,11 +198,23 @@ function ensureAlive() {
 }
 
 function onState(st) {
+  // おやすみタイマーで止めた直後に、自動の次の動画などが勝手に流れ出したら止め直す(本人が画面をさわったら解除)
+  if (st === 1 && sleepHoldUntil && Date.now() < sleepHoldUntil) {
+    try { player.pauseVideo(); } catch (_) { /* 何もしない */ }
+    setPs({ st: 2, buffering: false, userPaused: true });
+    return;
+  }
   const patch = { st, buffering: st === 3 };
   if (st === 1) {
     if (ps.upNext) clearNext();
     clearTimeout(kickTimer);
     patch.userPaused = false;
+    if (!ps.sleepAt && !ps.sleepEnd) autoSleep();
+    if (pendingSeek && pendingSeek.id === ps.id && curVid() === pendingSeek.id) {
+      const p = pendingSeek;
+      pendingSeek = null;
+      setTimeout(() => seekTo(p.sec), 0);
+    }
     if (!ps.started) {
       patch.started = true;
       if (!ps.manualPass) patch.pass = false;
@@ -229,6 +248,14 @@ function onState(st) {
   }
   if (st === 0) {
     saveNow(true, true);
+    // 「この動画が終わるまで」のおやすみタイマー: 次の動画へ進まず、ここで止める
+    if (ps.sleepEnd) {
+      setPs({ sleepEnd: false, sleepMin: 0 });
+      writeSleep(ps.dur || 0);
+      toast('おやすみなさい。動画が終わったので止めました', 4000);
+      if (ps.fs) exitFs();
+      return;
+    }
     // 小さい窓で流しているときは、勝手に再生画面へ移らない
     if (ps.mode === 'full' || ps.fs) scheduleNext();
   }
@@ -302,7 +329,8 @@ export async function load(id, { queue, short = false } = {}) {
   clearNext();
   captionsOffFor = '';
   if (ps.fs && short) exitFs();
-  setPs({ id, mode, st: -1, time: 0, dur: short ? 0 : videoInfo(id).dur || 0, error: '', live: false, upNext: null, autoPass: false, userPaused: false });
+  setPs({ id, mode, st: -1, time: 0, dur: short ? 0 : videoInfo(id).dur || 0, error: '', live: false, upNext: null, autoPass: false, userPaused: false, loadedAt: Date.now() });
+  if (pendingSeek && pendingSeek.id !== id) pendingSeek = null;
   if (!ps.manualPass && ps.started && ps.pass) setPs({ pass: false }); // 前の動画で「直接タップ」にしていたら戻す
   mediaMeta();
   // 別の端末で見た位置が届く前に始めると、古い位置から流して上書きしてしまうので、アプリを開いた直後の読み込みだけは少し待つ
@@ -398,8 +426,29 @@ export function playPrev() {
   clearNext();
   location.hash = `#/w/${q[i - 1]}`;
 }
-export function setPass(on) {
+let passTimer = 0;
+// autoMs: その時間がたったら操作ボタンに自動で戻す(広告のスキップ用)
+export function setPass(on, autoMs = 0) {
+  clearTimeout(passTimer);
   setPs({ pass: on, manualPass: on });
+  if (on && autoMs) {
+    passTimer = setTimeout(() => {
+      if (ps.pass && ps.manualPass) setPs({ pass: false, manualPass: false });
+    }, autoMs);
+  }
+}
+// 読み込み前でも、流れ始めたらその位置へ飛ぶ
+let pendingSeek = null;
+function curVid() {
+  try {
+    return player?.getVideoData?.()?.video_id || '';
+  } catch (_) {
+    return '';
+  }
+}
+export function seekWhenReady(id, sec) {
+  if (ps.id === id && player && [0, 1, 2, 3].includes(ps.st) && curVid() === id) return seekTo(sec);
+  pendingSeek = { id, sec };
 }
 
 // ------------------------------------------------------------------ 全画面
@@ -412,6 +461,13 @@ export function enterFs(fromRotate = false) {
     const p = can ? el.requestFullscreen({ navigationUI: 'hide' }) : null;
     p?.then?.(() => screen.orientation?.lock?.('landscape').catch(() => {})).catch(() => {});
   } catch (_) { /* iPhone は画面いっぱいの表示だけ */ }
+  // 縦のまま回したとき、初めの1回だけ「向きのロックを外すと本当の横画面になる」と案内する
+  try {
+    if (fsRotated() && !localStorage.getItem('tsuzuki:rotTip')) {
+      localStorage.setItem('tsuzuki:rotTip', '1');
+      setTimeout(() => toast('コントロールセンターの「画面の向きのロック」をオフにすると、時計の帯も消えた本当の横画面になります', 5000), 400);
+    }
+  } catch (_) { /* 何もしない */ }
   // iPhone の Chrome・Brave は、ページから上のバーを消せない(Apple の決まり)。ホーム画面のアイコンからなら消える
   if (IOS && !STANDALONE && !el.requestFullscreen && !fsTipShown) {
     fsTipShown = true;
@@ -441,6 +497,107 @@ try {
 export function fsRotated() {
   return ps.fs && PHONE && innerHeight > innerWidth;
 }
+// 回す向きを反対に(スマホを右に倒したか左に倒したかに合わせる)
+export function flipRot() {
+  const rev = !ps.rotRev;
+  try { localStorage.setItem('tsuzuki:rotDir', rev ? '-90' : '90'); } catch (_) { /* 何もしない */ }
+  setPs({ rotRev: rev });
+}
+
+// ------------------------------------------------------------------ おやすみタイマー
+// 寝落ちしても朝まで流れ続けないように、決めた時間で再生を止める。画面は止めたあと iPhone の自動ロックで消える
+// (アプリから電源や画面を消すことはできない)。止まったとき、止まった位置と「最後に画面をさわった位置」を覚えておき、
+// その動画を開き直したときに「どこまで見ていたか」を選べるようにする。
+const SLEEP_KEY = 'tsuzuki:sleep';
+let sleepTimer = 0;
+let autoGuard = 0;
+let lastTouch = { id: '', pos: 0, at: 0 };
+let autoOffFor = ''; // 自分で「オフ」にした動画には、自動のタイマーを入れ直さない
+let sleepHoldUntil = 0; // タイマーで止めた直後のしばらくは、勝手に流れ出したら止め直す
+for (const ev of ['pointerdown', 'keydown']) {
+  addEventListener(ev, () => { sleepHoldUntil = 0; }, { capture: true, passive: true });
+}
+function noteTouch() {
+  if (ps.id) lastTouch = { id: ps.id, pos: ps.time || 0, at: Date.now() };
+}
+for (const ev of ['pointerdown', 'keydown']) {
+  addEventListener(ev, () => { if ((ps.sleepAt || ps.sleepEnd) && ps.id) noteTouch(); }, { capture: true, passive: true });
+}
+// min: 0 = やめる / 'end' = この動画が終わるまで / 数字 = 分
+export function setSleep(min, auto = false) {
+  clearInterval(sleepTimer);
+  if (!min) {
+    if (!auto) autoOffFor = ps.id || '';
+    setPs({ sleepAt: 0, sleepLeft: 0, sleepEnd: false, sleepMin: 0, sleepWarn: false });
+    return;
+  }
+  noteTouch();
+  if (ps.sleepWarn) setPs({ sleepWarn: false });
+  if (min === 'end') {
+    setPs({ sleepAt: 0, sleepLeft: 0, sleepEnd: true, sleepMin: 'end' });
+    toast('この動画が終わったら止めます', 2200);
+    return;
+  }
+  setPs({ sleepAt: Date.now() + min * 60e3, sleepLeft: Math.max(1, Math.ceil(min)), sleepEnd: false, sleepMin: min });
+  sleepTimer = setInterval(sleepTick, 1000);
+  toast(`${min}分後に再生を止めます`, 2200);
+}
+function sleepTick() {
+  if (!ps.sleepAt) {
+    clearInterval(sleepTimer);
+    return;
+  }
+  const rest = ps.sleepAt - Date.now();
+  if (rest <= 0) return sleepStop();
+  if (rest < 60e3 && !ps.sleepWarn) {
+    setPs({ sleepWarn: true });
+    toast('まもなく止まります。続けて見るなら、動画の「+15分」を押してください', 4000);
+  }
+  const left = Math.max(1, Math.ceil(rest / 60e3));
+  if (left !== ps.sleepLeft) setPs({ sleepLeft: left });
+}
+// 止まった位置と「最後に画面をさわった位置」を覚え、開いている再生画面に「どこまで見たか」のカードを出す
+function writeSleep(pos) {
+  const id = ps.id;
+  if (!id || ps.mode === 'short') return;
+  const t = lastTouch.id === id ? lastTouch : null;
+  // 自動で次の動画へ進んでから止まったときは、最後にさわった「前の動画」の位置も残す
+  const other = lastTouch.id && lastTouch.id !== id
+    ? { touchId: lastTouch.id, touchPos: Math.round(lastTouch.pos), touchTitle: videoInfo(lastTouch.id).title || '' }
+    : {};
+  lsSetJson(SLEEP_KEY, { id, stop: Math.round(pos), touch: t ? Math.round(t.pos) : null, touchAt: t ? t.at : lastTouch.at || 0, at: Date.now(), ...other });
+  dispatchEvent(new Event('tz:sleep'));
+}
+function sleepStop() {
+  clearInterval(sleepTimer);
+  clearNext(); // 次の動画への待ちの最中でも、ここで止める
+  clearTimeout(kickTimer);
+  sleepHoldUntil = Date.now() + 20e3;
+  let pos = ps.time || 0;
+  try { pos = player?.getCurrentTime?.() || pos; } catch (_) { /* 準備中 */ }
+  setPs({ userPaused: true, sleepAt: 0, sleepLeft: 0, sleepEnd: false, sleepMin: 0, sleepWarn: false });
+  try { player?.pauseVideo(); } catch (_) { /* 準備中 */ }
+  saveNow(true);
+  writeSleep(pos);
+  if (ps.fs) exitFs();
+  toast('おやすみなさい。再生を止めました', 4500);
+}
+// 設定の「再生を始めたら自動でタイマーを入れる」(夜だけ、にもできる)
+function autoSleep() {
+  const pr = appState().prefs;
+  const m = Number(pr.sleepAuto) || 0;
+  if (!m || Date.now() - autoGuard < 120e3 || ps.mode === 'short' || (autoOffFor && autoOffFor === ps.id)) return;
+  if (pr.sleepNight !== false) {
+    const h = new Date().getHours();
+    if (!(h >= 22 || h < 5)) return;
+  }
+  autoGuard = Date.now();
+  setSleep(m, true);
+}
+document.addEventListener('visibilitychange', () => {
+  // 画面が戻ったとき、切れる時刻をとっくに過ぎていたらすぐ止める
+  if (document.visibilityState === 'visible' && ps.sleepAt && Date.now() >= ps.sleepAt) sleepStop();
+});
 
 // ------------------------------------------------------------------ ロック画面・コントロールセンターの表示と操作
 export function mediaMeta() {
@@ -475,7 +632,7 @@ function mediaState() {
   const h = (a, f) => {
     try { ms.setActionHandler(a, f); } catch (_) { /* その操作は無い */ }
   };
-  h('play', () => { setPs({ userPaused: false }); try { player?.playVideo(); } catch (_) {} });
+  h('play', () => { sleepHoldUntil = 0; setPs({ userPaused: false }); try { player?.playVideo(); } catch (_) {} });
   h('pause', () => { setPs({ userPaused: true }); try { player?.pauseVideo(); } catch (_) {} });
   h('previoustrack', () => { if (ps.mode !== 'short') playPrev(); });
   h('nexttrack', () => { if (ps.mode !== 'short' && nextCandidate()) playNext(); });
@@ -563,6 +720,7 @@ export const IC = {
   ff: 'M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z',
   rw: 'M11 18V6l-8.5 6 8.5 6zm.5-6 8.5 6V6l-8.5 6z',
   autoplay: 'M8 6.5v11l9-5.5z',
+  moon: 'M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 0 1-4.4 2.26 5.403 5.403 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z',
 };
 
 // 設定の窓(YouTube アプリと同じく、下から出る)
@@ -575,18 +733,29 @@ function PlayerSheet() {
   const time = usePlayer((p) => p.time);
   const autoNext = useSyncExternalStore(subscribeApp, () => appState().prefs.autoNext);
   const fs = usePlayer((p) => p.fs);
+  const sleepLeft = usePlayer((p) => p.sleepLeft);
+  const sleepEnd = usePlayer((p) => p.sleepEnd);
+  const sleepMin = usePlayer((p) => p.sleepMin);
+  const rev = usePlayer((p) => p.rotRev);
   if (!page) return null;
   const done = () => setPage(null);
-  return html`<div class=${clsx('sheet-bg pl-sheet', fs && fsRotated() && 'rot')} onClick=${done}>
+  return html`<div class=${clsx('sheet-bg pl-sheet', fs && fsRotated() && 'rot', rev && 'rev')} onClick=${done}>
     <div class="sheet" onClick=${(e) => e.stopPropagation()}>
       <div class="sheet-grip"></div>
       ${page === 'main' && html`
         <button class="sheet-i" onClick=${() => setPage('rate')}><${Icon} d=${IC.speed} /><span>再生速度</span><span class="sp"></span><span class="sheet-v">${(rate || 1) === 1 ? '標準' : (rate || 1) + 'x'}</span></button>
         <button class="sheet-i" onClick=${() => { setPref('autoNext', !autoNext); done(); }}><${Icon} d=${IC.autoplay} /><span>自動再生</span><span class="sp"></span><span class="sheet-v">${autoNext ? 'オン' : 'オフ'}</span></button>
+        <button class="sheet-i" onClick=${() => setPage('sleep')}><${Icon} d=${IC.moon} /><span>おやすみタイマー</span><span class="sp"></span><span class="sheet-v">${sleepLeft ? `あと${sleepLeft}分` : sleepEnd ? '動画の終わりまで' : 'オフ'}</span></button>
         <button class="sheet-i" onClick=${() => { restart(); done(); }}><${Icon} d=${IC.restart} /><span>最初から再生</span></button>
         <div class="sheet-i dim"><${Icon} d=${IC.cc} /><span>字幕</span><span class="sp"></span><span class="sheet-v">オフ(いつも)</span></div>
         <button class="sheet-i" onClick=${() => { setPass(true); done(); }}><${Icon} d=${IC.hand} /><span>YouTube の画面を直接さわる<small>広告の「スキップ」を押すときなど</small></span></button>
         <a class="sheet-i" href=${watchUrl(id, time)} target="_blank" rel="noopener" onClick=${() => { try { player?.pauseVideo(); } catch (_) {} done(); }}><${Icon} d=${IC.open} /><span>YouTube で開く(いまの位置から)</span></a>
+      `}
+      ${page === 'sleep' && html`
+        <div class="sheet-head"><button class="ib sm" onClick=${() => setPage('main')} aria-label="戻る"><${Icon} d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" /></button><b>おやすみタイマー</b></div>
+        ${[[0, 'オフ'], [15, '15 分'], [30, '30 分'], [45, '45 分'], [60, '60 分'], [90, '90 分'], ['end', 'この動画が終わるまで']].map(([m, label]) => html`<button key=${m} class=${clsx('sheet-i rate', m === (sleepMin || 0) && 'sel')} onClick=${() => { setSleep(m); done(); }}>
+          <span class="chk">${m === (sleepMin || 0) ? '✓' : ''}</span><span>${label}</span></button>`)}
+        <div class="sheet-i dim"><span>時間になると再生を止めます。画面は、iPhone の自動ロックで消えます。</span></div>
       `}
       ${page === 'rate' && html`
         <div class="sheet-head"><button class="ib sm" onClick=${() => setPage('main')} aria-label="戻る"><${Icon} d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" /></button><b>再生速度</b></div>
@@ -595,6 +764,55 @@ function PlayerSheet() {
       `}
     </div>
   </div>`;
+}
+
+// 引いた指を離したあと: 小さくするなら小さい窓のあたりへ吸いこまれてから小窓へ。そうでなければ元の位置へすっと戻す
+let settling = false;
+let settleTimer = 0;
+function clearDrag() {
+  const root = document.documentElement;
+  root.classList.remove('wdrag', 'wdrag-anim');
+  root.style.removeProperty('--wdrag');
+  root.style.removeProperty('--wdragp');
+}
+function dragSettle(down) {
+  const root = document.documentElement;
+  clearTimeout(settleTimer);
+  settling = true;
+  root.classList.add('wdrag-anim');
+  if (down) {
+    let target = innerHeight * 0.6;
+    try {
+      const tabs = document.querySelector('.tabs');
+      const ph = document.querySelector('.ph.full');
+      const cur = parseFloat(root.style.getPropertyValue('--wdrag')) || 0;
+      if (tabs && ph) target = tabs.getBoundingClientRect().top - 64 - (ph.getBoundingClientRect().top - cur);
+    } catch (_) { /* 何もしない */ }
+    root.style.setProperty('--wdrag', Math.max(0, Math.round(target)) + 'px');
+    root.style.setProperty('--wdragp', '1');
+    settleTimer = setTimeout(() => {
+      leaveWatch();
+      // 小窓に切りかわってから片づける(先に片づけると、一瞬もとの位置・大きさに戻って見える)
+      let n = 0;
+      let doneOnce = false;
+      const finish = () => {
+        if (doneOnce) return;
+        doneOnce = true;
+        settling = false;
+        clearDrag();
+      };
+      const wait = () => {
+        if (getPs().mode !== 'full' || ++n > 40) requestAnimationFrame(finish);
+        else requestAnimationFrame(wait);
+      };
+      requestAnimationFrame(wait);
+      settleTimer = setTimeout(finish, 700); // 画面の描き直しが止まっているとき(裏に回ったなど)の保険
+    }, 220);
+  } else {
+    root.style.setProperty('--wdrag', '0px');
+    root.style.setProperty('--wdragp', '0');
+    settleTimer = setTimeout(() => { settling = false; clearDrag(); }, 220);
+  }
 }
 
 function Controls() {
@@ -610,6 +828,11 @@ function Controls() {
   const live = usePlayer((p) => p.live);
   const buffering = usePlayer((p) => p.buffering);
   const upNext = usePlayer((p) => p.upNext);
+  const sleepLeft = usePlayer((p) => p.sleepLeft);
+  const sleepEnd = usePlayer((p) => p.sleepEnd);
+  const loadedAt = usePlayer((p) => p.loadedAt);
+  const sleepWarn = usePlayer((p) => p.sleepWarn);
+  const rotRev = usePlayer((p) => p.rotRev);
   const autoNext = useSyncExternalStore(subscribeApp, () => appState().prefs.autoNext);
   const [show, setShow] = useState(true);
   const [drag, setDrag] = useState(null);
@@ -645,9 +868,18 @@ function Controls() {
 
   // 指の動き: 下へ → 小さくする / 上へ → 全画面 / 全画面で下へ → 戻す / 長押し → 2倍速
   // 画面に対する指の位置を、動画の向きでの位置に直す(全画面で横に回しているとき)
-  const local = (e) => (fsRotated() ? { x: e.clientY, y: -e.clientX } : { x: e.clientX, y: e.clientY });
+  const local = (e) => (fsRotated() ? (getPs().rotRev ? { x: -e.clientY, y: e.clientX } : { x: e.clientY, y: -e.clientX }) : { x: e.clientX, y: e.clientY });
+  // 画面を離れる・切りかわるとき、途中の指の動きを片づける
+  useEffect(() => () => {
+    const s = g.current;
+    if (s && s.x != null) {
+      clearTimeout(s.lt);
+      if (s.long) setRate(s.prevRate);
+    }
+    if (!settling) clearDrag();
+  }, []);
   const onDown = (e) => {
-    if (e.target.closest('button, input, a, .pc-err, .pc-next')) return;
+    if (settling || e.target.closest('button, input, a, .pc-err, .pc-next')) return;
     const l = local(e);
     const s = { x: l.x, y: l.y, moved: false, drag: false, long: false, dy: 0 };
     s.lt = setTimeout(() => {
@@ -674,10 +906,20 @@ function Controls() {
       if (!s.long && Math.abs(dy) > Math.abs(dx)) s.drag = true;
     }
     if (s.drag) {
+      // 指の速さも見る(さっとはらったら、短くても小さくする)
+      const now = performance.now();
+      if (s.pt) s.vy = (dy - s.pdy) / Math.max(1, now - s.pt);
+      s.pt = now;
+      s.pdy = dy;
       s.dy = dy;
       if (!getPs().fs) {
-        document.documentElement.classList.add('wdrag');
-        document.documentElement.style.setProperty('--wdrag', Math.max(0, dy) + 'px');
+        const root = document.documentElement;
+        root.classList.remove('wdrag-anim');
+        root.classList.add('wdrag');
+        // 引いた分だけついてくる。上へは少しだけ(引っぱりすぎない)
+        const y = dy > 0 ? dy : dy / 4;
+        root.style.setProperty('--wdrag', y + 'px');
+        root.style.setProperty('--wdragp', String(Math.min(1, Math.max(0, dy) / 420)));
       }
     }
   };
@@ -692,12 +934,13 @@ function Controls() {
       s.suppress = true;
     } else if (s.drag) {
       s.suppress = true;
-      document.documentElement.style.removeProperty('--wdrag');
-      document.documentElement.classList.remove('wdrag');
-      if (cancel) return;
       const fsNow = getPs().fs;
-      if (!fsNow && s.dy > 90) leaveWatch();
-      else if (!fsNow && s.dy < -50) enterFs();
+      const fling = (s.vy || 0) > 0.55; // さっと下へはらった
+      const down = !cancel && !fsNow && (s.dy > 70 || (fling && s.dy > 24));
+      dragSettle(down);
+      if (cancel) return;
+      if (down) return;
+      if (!fsNow && s.dy < -50) enterFs();
       else if (fsNow && s.dy > 60) exitFs();
     }
   };
@@ -709,7 +952,7 @@ function Controls() {
     }
     if (e.target.closest('button, input, a')) return;
     const rect = e.currentTarget.getBoundingClientRect();
-    const x = fsRotated() ? (e.clientY - rect.top) / rect.height : (e.clientX - rect.left) / rect.width;
+    const x = fsRotated() ? (getPs().rotRev ? (rect.bottom - e.clientY) : (e.clientY - rect.top)) / rect.height : (e.clientX - rect.left) / rect.width;
     const now = Date.now();
     const tr = tapRef.current;
     if (now - tr.t < 300 && Math.abs(x - tr.x) < 0.25) {
@@ -774,11 +1017,16 @@ function Controls() {
       <div class="pc-next-bar" key=${upNext.id} style=${{ animationDuration: upNext.ms + 'ms' }}></div>
     </div>`}
     <div class="pc-shade"></div>
+    ${!live && Date.now() - loadedAt < 60e3 && html`<button class="pc-chip pc-adskip" onClick=${() => { setPass(true, 15000); toast('15秒だけ YouTube の画面を直接さわれます。広告の「スキップ」を押してください', 3500); }}>広告をスキップ</button>`}
+    ${sleepWarn && html`<button class="pc-chip pc-sleepwarn" onClick=${() => { setSleep(15); }}><${Icon} d=${IC.moon} size=${14} />まもなく止まります ・ +15分</button>`}
+    ${drag != null && html`<div class="pc-seektip">${fmtTime(drag)} <span>/ ${fmtTime(dur)}</span></div>`}
     <div class="pc-top">
       ${fs
         ? html`<button class="pc-ib" aria-label="全画面をやめる" onClick=${exitFs}><${Icon} d=${IC.down} size=${28} /></button><div class="pc-title">${videoInfo(id).title}</div>`
         : html`<button class="pc-ib" aria-label="小さくする" onClick=${leaveWatch}><${Icon} d=${IC.down} size=${30} /></button>`}
       <span class="sp"></span>
+      ${fs && fsRotated() && html`<button class="pc-ib" aria-label="向きを反対に" onClick=${() => { flipRot(); poke(); }}><${Icon} d=${IC.restart} size=${22} /></button>`}
+      ${(sleepLeft > 0 || sleepEnd) && html`<button class="pc-sleep" aria-label="おやすみタイマー" onClick=${() => settingsOpen?.('sleep')}><${Icon} d=${IC.moon} size=${14} /><span>${sleepEnd ? '終わりまで' : `あと${sleepLeft}分`}</span></button>`}
       <button class=${clsx('pc-auto', autoNext && 'on')} aria-label="自動再生" onClick=${() => { setPref('autoNext', !autoNext); poke(); toast(autoNext ? '自動再生はオフです' : '自動再生はオンです', 1500); }}>
         <i><${Icon} d=${autoNext ? IC.play : IC.pause} size=${12} /></i>
       </button>
@@ -796,7 +1044,7 @@ function Controls() {
       <button class="pc-ib" aria-label=${fs ? '全画面をやめる' : '全画面'} onClick=${() => (fs ? exitFs() : enterFs())}><${Icon} d=${fs ? IC.fsExit : IC.fs} /></button>
     </div>
     ${!live &&
-    html`<div class="pc-seek" style=${{ '--p': pct + '%' }}>
+    html`<div class=${clsx('pc-seek', drag != null && 'drag')} style=${{ '--p': pct + '%' }}>
       <input type="range" min="0" max=${Math.max(1, Math.floor(dur))} step="1" value=${Math.floor(shown)} aria-label="再生位置"
         onInput=${(e) => { dragRef.current = Number(e.target.value); setDrag(dragRef.current); poke(); }}
         onChange=${(e) => { dragRef.current = Number(e.target.value); setDrag(dragRef.current); }}
@@ -850,11 +1098,18 @@ export function PlayerShell() {
   }, []);
   // 回した全画面のときは、お知らせも回して出す(CSS の body.fs-rot)
   const rot = fs && fsRotated();
+  const rev = usePlayer((p) => p.rotRev);
   useEffect(() => {
     document.body.classList.toggle('fs-rot', !!rot);
-  }, [rot]);
+    document.body.classList.toggle('fs-rot-rev', !!rot && !!rev);
+  }, [rot, rev]);
+  useEffect(() => {
+    const r = document.body.dataset.route;
+    setThemeBlack(fs || r === 'watch' || r === 'shorts');
+  }, [fs]);
   // 小さい窓 → 再生画面 のときだけ、下からせり上がる
   useEffect(() => {
+    if (mode !== 'full' && !settling) clearDrag();
     const was = prevMode.current;
     prevMode.current = mode;
     if (mode === 'full' && (was === 'mini' || was === 'none')) {
@@ -889,7 +1144,7 @@ export function PlayerShell() {
     else if (dy > 40) close();
   };
   return html`<${React.Fragment}>
-    <div class=${clsx('ph', fs ? 'fs' : mode, enter && 'enter', fs && fsRotated() && 'rot')} aria-hidden=${mode === 'none' ? 'true' : 'false'}
+    <div class=${clsx('ph', fs ? 'fs' : mode, enter && 'enter', fs && fsRotated() && 'rot', fs && fsRotated() && rev && 'rev')} aria-hidden=${mode === 'none' ? 'true' : 'false'}
       onPointerDown=${mini ? mDown : null} onPointerMove=${mini ? mMove : null} onPointerUp=${mini ? mUp : null} onPointerCancel=${mini ? mUp : null}
       onClickCapture=${mini ? (e) => { if (mg.current.justMoved) { e.stopPropagation(); e.preventDefault(); } } : null}>
       <div class="ph-video">

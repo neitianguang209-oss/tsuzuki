@@ -264,10 +264,25 @@ export function TopBar({ route }) {
   </header>`;
 }
 
+let homeTapAt = 0;
 export function BottomNav({ route }) {
   const tab = (name, href, on, off, label) => {
     const sel = route.tab === name;
-    return html`<a class=${clsx('tab', sel && 'on')} href=${href} onClick=${() => { if (sel) scrollTo({ top: 0, behavior: 'smooth' }); }}>
+    const tap = () => {
+      if (!sel) return;
+      // ホームを押したとき: 下にいればいちばん上へ。もう上にいるか、続けて2回押したら「すべて」に戻る
+      if (name === 'home') {
+        const now = Date.now();
+        const dbl = now - homeTapAt < 800;
+        homeTapAt = now;
+        if (dbl || scrollY < 40) {
+          dispatchEvent(new Event('tz:home-reset'));
+          return;
+        }
+      }
+      scrollTo({ top: 0, behavior: 'smooth' });
+    };
+    return html`<a class=${clsx('tab', sel && 'on')} href=${href} onClick=${tap}>
       <${Icon} d=${sel ? on : off} /><span>${label}</span></a>`;
   };
   return html`<nav class="tabs">
@@ -315,7 +330,15 @@ export function Home() {
   const booted = useStore((s) => s.booted);
   const nch = useStore((s) => s.channels.length);
   const subShorts = useSubShorts(5);
-  const [chip, setChip] = useState(() => sessionStorage.getItem('tz:chip') || 'all');
+  const [chip, setChip] = useState(() => {
+    const c = sessionStorage.getItem('tz:chip');
+    return ['all', 'new', 'music', 'continue'].includes(c) ? c : 'all';
+  });
+  useEffect(() => {
+    const f = () => { setChip('all'); scrollTo({ top: 0 }); };
+    addEventListener('tz:home-reset', f);
+    return () => removeEventListener('tz:home-reset', f);
+  }, []);
   const basis = useRankBasis(chip);
   const aff = useAffinity(basis);
   const disc = useDiscover(basis, aff);
@@ -327,7 +350,6 @@ export function Home() {
   const morningLeft = morning.filter((v) => !progress[v.id]?.done);
   const shorts = prefs.shorts ? subShorts.slice(0, 12) : [];
   const cont = continueItems(progress);
-  const unwatched = long.filter((v) => !progress[v.id]);
   // 「すべて」= おすすめ順(よく見るチャンネル・新しさ・まだ見ていないか)+ 最近見た動画の関連から拾ったおすすめを混ぜる
   const ranked = useMemo(() => (chip === 'all' ? rankFeed(long, aff, basis.progress) : []), [chip, feed, aff, basis]);
   const mixed = useMemo(() => {
@@ -342,7 +364,7 @@ export function Home() {
     while (r < recs.length && out.length < 12) out.push(recs[r++]);
     return out;
   }, [chip, ranked, disc]);
-  const list = chip === 'all' ? mixed : chip === 'morning' ? morning : chip === 'unwatched' ? unwatched : chip === 'continue' ? cont : long;
+  const list = chip === 'all' ? mixed : chip === 'continue' ? cont : long;
   const ids = list.filter((v) => !v.live).map((v) => v.id);
   // 「すべて」のときは、YouTube と同じく動画3本のあとにショートの棚をはさむ
   const items = chip === 'all' && shorts.length ? [...list.slice(0, 3), { kind: 'shorts', id: '__shorts' }, ...list.slice(3)] : list;
@@ -354,15 +376,14 @@ export function Home() {
     </${Empty}>`;
   }
   return html`<div class="page">
-    <${Chips} value=${chip} onChange=${setChip} items=${[['all', 'すべて'], ['new', '新着'], ['music', '音楽'], ['morning', `けさの便${morningLeft.length ? ' ' + morningLeft.length : ''}`], ['unwatched', '未視聴'], ['continue', '続きから']]} />
+    <${Chips} value=${chip} onChange=${setChip} items=${[['all', 'すべて'], ['new', '新着'], ['music', '音楽'], ['continue', '続きから']]} />
     ${chip === 'music' && html`<${MusicView} feed=${long} />`}
     ${chip === 'all' && html`
       ${morning.length > 0 && html`<${MorningBox} items=${morning} left=${morningLeft} end=${end} />`}
       ${cont.length > 0 && html`<${Shelf} title="続きから見る">${cont.map((v) => html`<${VideoCard} key=${v.id} v=${v} variant="shelf" queue=${cont.map((x) => x.id)} />`)}</${Shelf}>`}
     `}
-    ${chip === 'morning' && html`<div class="morning-head">${fmtDay(end)} ${prefs.morningHour}時の便 ・ ${fmtDay(start).replace(/\(.\)/, '')} ${prefs.morningHour}時から届いた ${morning.length} 本</div>`}
     ${chip === 'music' ? null : list.length === 0
-      ? html`<${Empty}>${chip === 'continue' ? '途中まで見た動画はありません' : chip === 'morning' ? 'けさの便に入った動画はありません' : '動画がありません'}</${Empty}>`
+      ? html`<${Empty}>${chip === 'continue' ? '途中まで見た動画はありません' : '動画がありません'}</${Empty}>`
       : html`<div class="grid"><${Paged} items=${items} resetKey=${chip} render=${(v) =>
           v.kind === 'shorts' ? html`<div class="grid-full" key="__shorts"><${ShortsShelf} items=${shorts} /></div>` : html`<${VideoCard} key=${v.id} v=${v} queue=${ids} />`} /></div>`}
   </div>`;
@@ -920,6 +941,38 @@ export function Search({ q: q0 }) {
 }
 
 // ------------------------------------------------------------------ 再生画面
+function readSleep(id) {
+  const s = lsGetJson('tsuzuki:sleep', null);
+  if (!s || Date.now() - s.at > 18 * 3600e3 || (s.id !== id && s.touchId !== id)) return null;
+  if (sleepStale(s)) {
+    lsSetJson('tsuzuki:sleep', null);
+    return null;
+  }
+  return s;
+}
+// 止まったあと、その動画を続けて見た(止まった位置より1分以上先まで進んだ・見終わった)ら、もうカードは要らない
+function sleepStale(s) {
+  const p = getState().progress[s.id];
+  if (!p || new Date(p.at || 0).getTime() <= s.at) return false;
+  return !!p.done || (p.pos || 0) > s.stop + 60;
+}
+// おやすみタイマーで止まった動画の「どこまで見たか」カード
+function SleepCard({ sl, id, onDone }) {
+  const here = sl.id === id;
+  const sameTouch = here && sl.touch != null && sl.touch < sl.stop - 60;
+  return html`<div class="w-sleep">
+    <div class="w-sleep-t"><${Icon} d=${P.IC.moon} size=${16} /><b>${here ? 'おやすみタイマーで止まった動画です' : 'おやすみタイマーの前に見ていた動画です'}</b></div>
+    <div class="w-sleep-s">${here
+      ? html`止まった位置 ${fmtTime(sl.stop)}${sameTouch ? ` ・ 最後に画面をさわった位置 ${fmtTime(sl.touch)}` : ''}${sl.touchId ? html`<br />最後に画面をさわったのは、前の動画「${sl.touchTitle || '前の動画'}」の ${fmtTime(sl.touchPos)} です` : ''}`
+      : html`最後に画面をさわった位置 ${fmtTime(sl.touchPos)}`}</div>
+    <div class="w-sleep-b">
+      ${sameTouch && html`<button class="btn sm" onClick=${() => { P.seekWhenReady(id, sl.touch); onDone(); }}>最後にさわった位置から</button>`}
+      ${here && sl.touchId && html`<button class="btn sm" onClick=${() => { P.seekWhenReady(sl.touchId, sl.touchPos); onDone(); play(sl.touchId); }}>前の動画のその位置へ</button>`}
+      ${!here && html`<button class="btn sm" onClick=${() => { P.seekWhenReady(id, sl.touchPos); onDone(); }}>${fmtTime(sl.touchPos)} から見る</button>`}
+      <button class="btn sm ghost" onClick=${onDone}>このまま続ける</button>
+    </div>
+  </div>`;
+}
 const comCache = new Map(); // 動画ID → { items, cont, count, busy }
 function useComments(id, detail) {
   const [, force] = useState(0);
@@ -985,6 +1038,20 @@ export function Watch({ id }) {
   const [panel, setPanel] = useState(null); // 'desc' | 'comments'
   const later = useStore((s) => s.later.some((l) => l.id === id));
   const wide = useWide(1000);
+  const [sl, setSl] = useState(() => readSleep(id));
+  const pp = useStore((st) => st.progress[id]);
+  useEffect(() => {
+    if (sl && sl.id === id && sleepStale(sl)) {
+      lsSetJson('tsuzuki:sleep', null);
+      setSl(null);
+    }
+  }, [pp?.pos, pp?.done]);
+  useEffect(() => {
+    setSl(readSleep(id));
+    const f = () => setSl(readSleep(id));
+    addEventListener('tz:sleep', f);
+    return () => removeEventListener('tz:sleep', f);
+  }, [id]);
   useStore((s) => s.channels); // 登録の変化で描き直す
   useEffect(() => {
     const q = nextQueue;
@@ -1033,6 +1100,7 @@ export function Watch({ id }) {
     <div class="w-spacer"></div>
     <div class="w-main">
       <div class="w-info">
+        ${sl && html`<${SleepCard} sl=${sl} id=${id} onDone=${() => { lsSetJson('tsuzuki:sleep', null); setSl(null); }} />`}
         <div class="w-tap" onClick=${() => setPanel('desc')}>
           <h1 class="w-title">${title}</h1>
           <div class="w-meta">${[views, when].filter(Boolean).join('  ')} <b>…さらに表示</b></div>
@@ -1163,6 +1231,7 @@ export function Settings() {
         </select>
       </label>
     </div>
+    <${SleepSettings} />
     <${NoRecList} />
     <${HowTo} />
     <h2 class="sec-h">データ</h2>
@@ -1177,6 +1246,30 @@ export function Settings() {
       <p>広告を消す仕組みは入れていません(YouTube の決まりで禁止のため)。広告をふせぎたいときは、広告ブロックつきのブラウザ(Brave など)でこのページを開いてください。</p>
     </div>
   </div>`;
+}
+
+// おやすみタイマー(寝落ち対策)
+function SleepSettings() {
+  const prefs = useStore((s) => s.prefs);
+  const left = P.usePlayer((p) => p.sleepLeft);
+  const end = P.usePlayer((p) => p.sleepEnd);
+  return html`<h2 class="sec-h">おやすみタイマー</h2>
+    <div class="list-box">
+      <div class="li"><span>いまのタイマー</span><span class="sp"></span><b>${left ? `あと ${left} 分` : end ? '動画の終わりまで' : 'オフ'}</b></div>
+      <div class="li chips-in">
+        ${[[15, '15 分'], [30, '30 分'], [60, '60 分'], ['end', '動画の終わり'], [0, 'やめる']].map(([m, label]) => html`<button key=${m} class="chip" onClick=${() => P.setSleep(m)}>${label}</button>`)}
+      </div>
+      <label class="li"><span>再生を始めたら自動でタイマーを入れる</span><span class="sp"></span>
+        <select value=${prefs.sleepAuto || 0} onChange=${(e) => setPref('sleepAuto', Number(e.target.value))}>
+          ${[[0, 'しない'], [30, '30 分'], [45, '45 分'], [60, '60 分'], [90, '90 分']].map(([m, label]) => html`<option key=${m} value=${m}>${label}</option>`)}
+        </select>
+      </label>
+      <label class="li"><span>自動のタイマーは夜だけ(22時〜朝5時)</span><span class="sp"></span><span class="switch"><input type="checkbox" checked=${prefs.sleepNight !== false} onChange=${(e) => setPref('sleepNight', e.target.checked)} /><i></i></span></label>
+      <div class="li col">
+        <span>時間になると再生を止めて、止まった位置と「最後に画面をさわった位置」を覚えます。次にその動画を開くと、どちらから見るか選べます。</span>
+        <span>画面は、止まったあと iPhone の自動ロックで消えます(アプリから電源は切れません)。すぐ消したいときは、設定アプリ →「画面表示と明るさ」→「自動ロック」を短くしてください。</span>
+      </div>
+    </div>`;
 }
 
 // 「チャンネルをおすすめに表示しない」にしたものを戻す

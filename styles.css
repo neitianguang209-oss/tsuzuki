@@ -543,6 +543,55 @@ body.fs-rot .toast { left: 44px; top: 50%; bottom: auto; transform: translate(-5
 /* 直接タップの状態でも全画面をやめられる */
 .pc-fsx { position: absolute; left: 8px; top: 8px; pointer-events: auto; }
 
-/* 広告の「スキップ」を押せるように: 操作ボタンが隠れているあいだ、動画の右下の一角はタップをそのまま YouTube の画面に通す
-   (clip-path で切り抜いた部分は、タップを受けとらない) */
-.pc:not(.on) { clip-path: polygon(0 0, 100% 0, 100% 60%, 58% 60%, 58% 100%, 0 100%); }
+
+/* ------------------------------------------------------------ v1.4 おやすみタイマー */
+.pc-sleep { display: inline-flex; align-items: center; gap: 4px; height: 28px; padding: 0 10px; margin-right: 2px; border-radius: 14px; background: rgba(255,255,255,.2); color: #fff; font-size: 12px; font-weight: 500; white-space: nowrap; }
+.w-sleep { margin: 0 0 12px; padding: 12px; border-radius: 12px; background: var(--bg2); }
+.w-sleep-t { display: flex; align-items: center; gap: 6px; font-size: 14px; }
+.w-sleep-s { color: var(--fg2); font-size: 13px; margin: 4px 0 10px; }
+.w-sleep-b { display: flex; flex-wrap: wrap; gap: 8px; }
+.li.chips-in { flex-wrap: wrap; gap: 8px; }
+
+/* ------------------------------------------------------------ v1.5 */
+/* 広告のスキップは「広告をスキップ」ボタン(15秒だけ YouTube の画面を直接さわれる)で。右下の穴はやめた(YouTube のロゴに当たって飛んでしまうため) */
+.pc-adskip { position: absolute; left: 52px; top: 10px; z-index: 3; pointer-events: auto; background: rgba(0, 0, 0, 0.6); white-space: nowrap; }
+.ph.fs .pc-adskip { left: calc(12px + env(safe-area-inset-left, 0px)); top: calc(56px + max(0px, var(--sat))); }
+.ph.fs.rot .pc-adskip { left: 12px; top: 56px; }
+/* 縦のまま回した全画面: 動画は、切り欠き・ホームバーをよけた範囲のまん中に置く(右や左に寄らないように) */
+.ph.fs.rot {
+  top: calc(var(--sat) + (100vh - var(--sat) - var(--sab)) / 2);
+  top: calc(var(--sat) + (100dvh - var(--sat) - var(--sab)) / 2);
+  width: calc(100vh - var(--sat) - var(--sab));
+  width: calc(100dvh - var(--sat) - var(--sab));
+}
+.ph.fs.rot .pc-bottom { bottom: 30px; padding: 0 20px; }
+.ph.fs.rot .pc-seek { bottom: 10px; left: 16px; right: 16px; }
+.ph.fs.rot .pc-top { padding: 8px 12px; }
+/* 回した全画面のまわり(切り欠き・ホームバーのところ)も黒で埋める */
+body.fs-rot::after { content: ''; position: fixed; inset: 0; background: #000; z-index: 999; }
+/* 下へ引いて小さくする: 引くほど下の情報がうすくなり、離したらすっと動く */
+html.wdrag .watch { opacity: calc(1 - var(--wdragp, 0) * 0.85); }
+html.wdrag .ph.full { scale: calc(1 - var(--wdragp, 0) * 0.6); transform-origin: 0 0; }
+html.wdrag body[data-route="watch"]::before { opacity: calc(1 - var(--wdragp, 0)); }
+html.wdrag-anim .ph.full, html.wdrag-anim .watch, html.wdrag-anim body[data-route="watch"]::before {
+  transition: translate 0.22s ease-out, scale 0.22s ease-out, opacity 0.22s ease-out;
+}
+
+/* ------------------------------------------------------------ v1.5 その2 */
+.pc-sleep { flex: 0 1 auto; min-width: 0; overflow: hidden; }
+.pc-sleep span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pc-sleepwarn { position: absolute; right: 8px; bottom: 44px; z-index: 3; pointer-events: auto; display: inline-flex; align-items: center; gap: 4px; background: rgba(0, 0, 0, 0.7); white-space: nowrap; }
+/* 再生位置のバー: 指でつかみやすく(さわれる高さを広げる。見た目の線は細いまま)。動かしている間は時刻を大きく出す */
+.pc-seek { bottom: -16px; height: 36px; }
+.pc-seek input { height: 36px; }
+.pc-seek.drag input::-webkit-slider-thumb { width: 18px; height: 18px; margin-top: -7.5px; }
+.pc-seek.drag input::-moz-range-thumb { width: 18px; height: 18px; }
+.ph.fs .pc-seek { bottom: calc(2px + var(--sab)); }
+.ph.fs:not(.rot) .pc-seek { left: 16px; right: 16px; }
+.ph.fs.rot .pc-seek { bottom: 2px; }
+.pc-seektip { position: absolute; left: 50%; top: 40%; transform: translate(-50%, -50%); z-index: 3; padding: 6px 14px; border-radius: 18px; background: rgba(0, 0, 0, 0.7); color: #fff; font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; pointer-events: none; }
+.pc-seektip span { font-size: 14px; font-weight: 500; opacity: 0.75; }
+/* 回す向きを反対に */
+.ph.fs.rot.rev { transform: translate(-50%, -50%) rotate(-90deg); }
+.sheet-bg.pl-sheet.rot.rev { transform: translate(-50%, -50%) rotate(-90deg); }
+body.fs-rot.fs-rot-rev .toast { left: auto; right: 44px; transform: translate(50%, -50%) rotate(-90deg); }

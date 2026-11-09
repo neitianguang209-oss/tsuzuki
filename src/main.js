@@ -1,12 +1,12 @@
 import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { html, noteRoute } from './util.js';
+import { html, noteRoute, setThemeBlack } from './util.js';
 import { takeKeyFromUrl } from './api.js';
 import { useStore, load, getState, setState, refreshFeed } from './store.js';
 import { PlayerShell, setMode, getPs, close as closePlayer } from './player.js';
 import { TopBar, BottomNav, Home, Subs, Channels, AddChannel, ChannelPage, Search, Watch, Me, Settings, HistoryPage, LaterPage, KeyGate, Sheet, ShortsPage } from './views.js';
 
-window.TZ_VERSION = '1.3.1';
+window.TZ_VERSION = '1.5.0';
 takeKeyFromUrl();
 
 function dec(x) {
@@ -120,6 +120,7 @@ function App() {
     else if (route.name !== 'watch' && ps.id && ps.mode === 'full') setMode('mini');
     document.body.dataset.route = needKey ? 'gate' : route.name;
     document.body.classList.remove('hide-top');
+    setThemeBlack(!needKey && (route.name === 'watch' || route.name === 'shorts' || getPs().fs));
   }, [route.name, needKey]);
   // 合言葉の画面に入るときは、流していた動画を止める(プレーヤーの箱は外さない)
   useEffect(() => {

@@ -111,3 +111,12 @@ export function lsSetJson(k, v) {
     return false;
   }
 }
+
+// 時計の帯(ステータスバー)の色: 再生画面・全画面のときだけ黒に(ホーム画面のアイコンで効く。ブラウザでは何も変わらないこともある)
+const themeOrig = new Map();
+export function setThemeBlack(on) {
+  for (const m of document.querySelectorAll('meta[name="theme-color"]')) {
+    if (!themeOrig.has(m)) themeOrig.set(m, m.getAttribute('content'));
+    m.setAttribute('content', on ? '#000000' : themeOrig.get(m));
+  }
+}

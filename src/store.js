@@ -8,7 +8,7 @@ const PROG = 'tsuzuki:prog';
 const DIRTY = 'tsuzuki:dirty';
 const PREFS = 'tsuzuki:prefs';
 
-const DEFAULT_PREFS = { shorts: true, autoNext: true, rate: 1, morningHour: 6, hideWatched: false };
+const DEFAULT_PREFS = { shorts: true, autoNext: true, rate: 1, morningHour: 6, hideWatched: false, sleepAuto: 0, sleepNight: true };
 
 const cache = lsGetJson(CACHE, null);
 let state = {
