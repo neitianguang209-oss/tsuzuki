@@ -542,3 +542,7 @@ body[data-route="watch"] .toast { bottom: calc(var(--tabh) + var(--sab) + 16px);
 body.fs-rot .toast { left: 44px; top: 50%; bottom: auto; transform: translate(-50%, -50%) rotate(90deg); max-width: 80vh; }
 /* 直接タップの状態でも全画面をやめられる */
 .pc-fsx { position: absolute; left: 8px; top: 8px; pointer-events: auto; }
+
+/* 広告の「スキップ」を押せるように: 操作ボタンが隠れているあいだ、動画の右下の一角はタップをそのまま YouTube の画面に通す
+   (clip-path で切り抜いた部分は、タップを受けとらない) */
+.pc:not(.on) { clip-path: polygon(0 0, 100% 0, 100% 60%, 58% 60%, 58% 100%, 0 100%); }

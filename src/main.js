@@ -6,7 +6,7 @@ import { useStore, load, getState, setState, refreshFeed } from './store.js';
 import { PlayerShell, setMode, getPs, close as closePlayer } from './player.js';
 import { TopBar, BottomNav, Home, Subs, Channels, AddChannel, ChannelPage, Search, Watch, Me, Settings, HistoryPage, LaterPage, KeyGate, Sheet, ShortsPage } from './views.js';
 
-window.TZ_VERSION = '1.3.0';
+window.TZ_VERSION = '1.3.1';
 takeKeyFromUrl();
 
 function dec(x) {
