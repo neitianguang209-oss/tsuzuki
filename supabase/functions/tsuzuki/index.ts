@@ -215,8 +215,11 @@ function harvest(root: Any) {
 }
 
 // ------------------------------------------------------------------ 検索
-async function search(q: string, cont?: string) {
-  const d = cont ? await yti('search', { continuation: cont }) : await yti('search', { query: q });
+// 並べ方・絞り込み(YouTube の検索フィルタ): 決まったものだけ通す
+const SEARCH_PARAMS = new Set(['CAISAhAB', 'EgIQAQ==', 'CAMSAhAB', 'EgQQARgC', 'EgQQARgB', 'EgQIAxAB', 'EgQIBBAB']);
+async function search(q: string, cont?: string, sp?: string) {
+  const params = sp && SEARCH_PARAMS.has(sp) ? { params: sp } : {};
+  const d = cont ? await yti('search', { continuation: cont }) : await yti('search', { query: q, ...params });
   const h = harvest(cont ? d.onResponseReceivedCommands : d.contents);
   return { videos: h.videos, channels: h.channels, shorts: h.shorts, cont: h.cont };
 }
@@ -545,7 +548,7 @@ Deno.serve(async (req) => {
   try {
     switch (body.action) {
       case 'search':
-        return json(await search(String(body.q || '').slice(0, 200), body.cont));
+        return json(await search(String(body.q || '').slice(0, 200), body.cont, typeof body.sp === 'string' ? body.sp : ''));
       case 'video':
         return json(await video(String(body.id || '')));
       case 'channel':

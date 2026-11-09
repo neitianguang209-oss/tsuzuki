@@ -322,7 +322,9 @@ body.hide-top .tabs2 { top: var(--sat); }
 .switch input:checked + i::after { transform: translateX(16px); }
 
 /* ------------------------------------------------------------ 再生画面 */
-.watch { max-width: 1100px; margin: 0 auto; translate: 0 var(--wdrag, 0px); }
+.watch { max-width: 1100px; margin: 0 auto; }
+/* 指で引いている間だけずらす(いつも translate を付けると、説明・コメントの窓が画面に固定されなくなる) */
+html.wdrag .watch { translate: 0 var(--wdrag, 0px); }
 body[data-route="watch"] .watch { animation: wEnter 0.28s ease-out; }
 @keyframes wEnter { from { translate: 0 40vh; opacity: 0; } to { translate: 0 0; opacity: 1; } }
 .w-spacer { height: calc(var(--phh) + var(--sat)); }
@@ -485,8 +487,8 @@ body[data-route="watch"]::before { content: ''; position: fixed; left: 0; right:
 @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
 .toast {
   position: fixed; left: 50%; bottom: calc(var(--tabh) + var(--sab) + var(--minih) + 16px); transform: translateX(-50%); z-index: 1200;
-  background: #323232; color: #fff; padding: 10px 16px; border-radius: 8px; font-size: 14px; max-width: calc(100vw - 32px);
-  box-shadow: var(--shadow); animation: up 0.2s ease-out;
+  background: #323232; color: #fff; padding: 10px 16px; border-radius: 8px; font-size: 14px; width: max-content; max-width: calc(100vw - 32px);
+  box-shadow: var(--shadow); animation: pup 0.2s ease-out;
 }
 body[data-route="watch"] .toast { bottom: 24px; }
 
@@ -497,3 +499,46 @@ body[data-route="watch"] .toast { bottom: 24px; }
 .gate p { margin: 0; color: var(--fg2); font-size: 14px; }
 .gate form { display: grid; gap: 10px; width: 100%; }
 .gate .field { width: 100%; }
+
+/* ------------------------------------------------------------ v1.2 */
+html, body { overflow-x: clip; }
+/* 再生画面でも下のタブを出す */
+body[data-route="watch"] .main { padding-bottom: calc(var(--tabh) + var(--sab) + 24px); }
+.panel { bottom: calc(var(--tabh) + var(--sab)); }
+body[data-route="watch"] .toast { bottom: calc(var(--tabh) + var(--sab) + 16px); }
+/* 全画面で、画面の向きが縦のまま(向きの固定など)のときは動画を横に回す */
+.ph.fs.rot { inset: auto; top: 50%; left: 50%; width: 100vh; height: 100vw; width: 100dvh; height: 100dvw; transform: translate(-50%, -50%) rotate(90deg); }
+/* 登録チャンネルの丸い列: 右はしの「すべて」はいつも見える */
+.ch-strip-wrap { position: relative; display: flex; align-items: center; }
+.ch-strip-wrap .ch-strip { flex: 1; min-width: 0; padding-right: 8px; }
+.ch-all { flex: none; align-self: stretch; display: grid; place-items: center; padding: 0 14px 12px 10px; color: var(--blue); font-weight: 500; font-size: 14px; background: linear-gradient(to right, transparent, var(--bg) 12px); margin-left: -12px; position: relative; z-index: 1; }
+.ch-dot { position: relative; }
+.ch-new { position: absolute; top: 2px; right: 6px; width: 10px; height: 10px; border-radius: 50%; background: var(--blue); border: 2px solid var(--bg); }
+.ch-sort { margin: 8px 0 4px; }
+/* 音楽 */
+.music-lead { color: var(--fg2); font-size: 13px; margin: 0 16px 8px; }
+.sk { border-radius: 8px; animation: skp 1.2s ease-in-out infinite; }
+.sk-line { height: 12px; margin-top: 10px; border-radius: 6px; background: var(--bg2); width: 80%; animation: skp 1.2s ease-in-out infinite; }
+@keyframes skp { 50% { opacity: 0.5; } }
+/* 使い方のこつ */
+.li.col { flex-direction: column; align-items: flex-start; gap: 4px; }
+.li.col span { color: var(--fg2); font-size: 13px; }
+/* 全画面: 動画は画面の安全な範囲(切り欠き・ホームバーをよけた範囲)のまん中に置く */
+.ph.fs:not(.rot) .ph-video { left: env(safe-area-inset-left, 0px); right: env(safe-area-inset-right, 0px); }
+.shelf-h h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shelf-h .btn { flex: none; }
+
+/* 横向きの全画面: 動画の箱がもう安全領域をよけているので、操作ボタンは二重によけない */
+.ph.fs:not(.rot) .pc-bottom { padding: 0 20px; }
+.ph.fs:not(.rot) .pc-seek { left: 16px; right: 16px; }
+.ph.fs:not(.rot) .pc-top { padding: max(8px, var(--sat)) 12px 8px; }
+/* 縦のまま回した全画面: よける向きも回す(箱の左右 = 本体の上下) */
+.ph.fs.rot .pc-bottom { bottom: 30px; padding: 0 calc(20px + var(--sab)) 0 calc(20px + var(--sat)); }
+.ph.fs.rot .pc-seek { bottom: 10px; left: calc(16px + var(--sat)); right: calc(16px + var(--sab)); }
+.ph.fs.rot .pc-top { padding: 8px calc(12px + var(--sab)) 8px calc(12px + var(--sat)); }
+/* 回した全画面で開く設定の窓・お知らせも同じ向きに回す */
+.sheet-bg.pl-sheet.rot { inset: auto; top: 50%; left: 50%; width: 100vh; height: 100vw; width: 100dvh; height: 100dvw; transform: translate(-50%, -50%) rotate(90deg); }
+.sheet-bg.pl-sheet.rot .sheet { max-height: 80%; margin-bottom: 8px; }
+body.fs-rot .toast { left: 44px; top: 50%; bottom: auto; transform: translate(-50%, -50%) rotate(90deg); max-width: 80vh; }
+/* 直接タップの状態でも全画面をやめられる */
+.pc-fsx { position: absolute; left: 8px; top: 8px; pointer-events: auto; }

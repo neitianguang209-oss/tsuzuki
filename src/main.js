@@ -2,11 +2,11 @@ import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { html, noteRoute } from './util.js';
 import { takeKeyFromUrl } from './api.js';
-import { useStore, load, getState, refreshFeed } from './store.js';
+import { useStore, load, getState, setState, refreshFeed } from './store.js';
 import { PlayerShell, setMode, getPs, close as closePlayer } from './player.js';
 import { TopBar, BottomNav, Home, Subs, Channels, AddChannel, ChannelPage, Search, Watch, Me, Settings, HistoryPage, LaterPage, KeyGate, Sheet, ShortsPage } from './views.js';
 
-window.TZ_VERSION = '1.1.0';
+window.TZ_VERSION = '1.2.0';
 takeKeyFromUrl();
 
 function dec(x) {
@@ -117,7 +117,7 @@ function App() {
   useEffect(() => {
     const ps = getPs();
     if (ps.id && ps.mode === 'short' && route.name !== 'shorts') closePlayer();
-    else if (route.name !== 'watch' && route.name !== 'shorts' && ps.id) setMode('mini');
+    else if (route.name !== 'watch' && ps.id && ps.mode === 'full') setMode('mini');
     document.body.dataset.route = needKey ? 'gate' : route.name;
     document.body.classList.remove('hide-top');
   }, [route.name, needKey]);
@@ -162,7 +162,11 @@ load();
 let hiddenAt = 0;
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') hiddenAt = Date.now();
-  else if (hiddenAt && Date.now() - hiddenAt > 10 * 60e3) load({ quiet: true });
+  else if (hiddenAt && Date.now() - hiddenAt > 10 * 60e3) {
+    // 読み込み直している間に動画を開くと、ほかの端末で見た位置より古い位置から流してしまうので、その間だけ待ってもらう
+    setState({ resyncing: true });
+    load({ quiet: true, after: true }).finally(() => setState({ resyncing: false }));
+  }
 });
 
 if ('serviceWorker' in navigator && location.hostname !== 'localhost') {

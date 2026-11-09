@@ -22,7 +22,28 @@ let ps = {
   ready: false,
   live: false,
   buffering: false,
+  autoPass: false, // 自動で始まらなかったので、動画を直接タップしてもらう状態
+  userPaused: false,
 };
+
+// iPhone・iPad か / ホーム画面のアイコンから開いているか
+export const IOS = /iP(hone|od|ad)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+export const STANDALONE = (() => {
+  try {
+    return matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+  } catch (_) {
+    return false;
+  }
+})();
+const TOUCH = (() => {
+  try {
+    return matchMedia('(pointer: coarse)').matches;
+  } catch (_) {
+    return false;
+  }
+})();
+// スマホだけ(iPad・タブレットは、横にしても勝手に全画面にせず、縦の全画面でも回さない)
+const PHONE = TOUCH && Math.min(screen.width, screen.height) < 600;
 const pl = new Set();
 const pEmit = () => pl.forEach((l) => l());
 function setPs(patch) {
@@ -146,6 +167,7 @@ function create() {
           else {
             try { player.playVideo(); } catch (_) { /* iPhone は最初はタップが要る */ }
           }
+          if (ps.started) kick(ps.id);
         },
         onStateChange: (e) => onState(e.data),
         onError: (e) => onError(e.data),
@@ -172,8 +194,14 @@ function onState(st) {
   const patch = { st, buffering: st === 3 };
   if (st === 1) {
     if (ps.upNext) clearNext();
+    clearTimeout(kickTimer);
+    patch.userPaused = false;
     if (!ps.started) {
       patch.started = true;
+      if (!ps.manualPass) patch.pass = false;
+    }
+    if (ps.autoPass) {
+      patch.autoPass = false;
       if (!ps.manualPass) patch.pass = false;
     }
     patch.error = '';
@@ -188,6 +216,8 @@ function onState(st) {
     } catch (_) { /* 古いAPI */ }
   }
   setPs(patch);
+  if (st === 1) mediaMeta();
+  mediaState();
   if (st === 2) saveNow(true);
   if (st === 0 && ps.mode === 'short') {
     // ショートは YouTube アプリと同じく、くり返し流す
@@ -271,10 +301,13 @@ export async function load(id, { queue, short = false } = {}) {
   if (ps.id) saveNow(true);
   clearNext();
   captionsOffFor = '';
-  if (ps.fs) exitFs();
-  setPs({ id, mode, st: -1, time: 0, dur: short ? 0 : videoInfo(id).dur || 0, error: '', live: false, upNext: null });
-  // 別の端末で見た位置が届く前に始めると、古い位置から流して上書きしてしまうので、読み込み中なら少し待つ
-  if (!short) await whenLoaded(3500);
+  if (ps.fs && short) exitFs();
+  setPs({ id, mode, st: -1, time: 0, dur: short ? 0 : videoInfo(id).dur || 0, error: '', live: false, upNext: null, autoPass: false, userPaused: false });
+  if (!ps.manualPass && ps.started && ps.pass) setPs({ pass: false }); // 前の動画で「直接タップ」にしていたら戻す
+  mediaMeta();
+  // 別の端末で見た位置が届く前に始めると、古い位置から流して上書きしてしまうので、アプリを開いた直後の読み込みだけは少し待つ
+  // (2本目からは待たない。待つと、押しても切りかわらないように見える)
+  if (!short && (!appState().booted || appState().resyncing)) await whenLoaded(3500);
   if (ps.id !== id) return; // 待っている間に別の動画が選ばれた
   const start = short ? 0 : resumePoint(id);
   setPs({ time: start });
@@ -284,7 +317,23 @@ export async function load(id, { queue, short = false } = {}) {
     return;
   }
   player.loadVideoById({ videoId: id, startSeconds: start });
+  kick(id);
   if (start > 5) toast(`${fmtTime(start)} から再開します`, 1800);
+}
+
+// 押した動画が自動で始まらないとき(iPhone でときどき起きる): もう一度「再生」を送り、
+// それでも動かなければ、動画を直接タップしてもらう状態にする(YouTube の画面への1タップなら必ず始まる)
+let kickTimer = 0;
+function kick(id) {
+  clearTimeout(kickTimer);
+  kickTimer = setTimeout(() => {
+    if (ps.id !== id || ps.st === 1 || ps.st === 3 || ps.userPaused || ps.error || document.visibilityState === 'hidden') return;
+    try { player?.playVideo(); } catch (_) { /* 準備中 */ }
+    kickTimer = setTimeout(() => {
+      if (ps.id !== id || ps.st === 1 || ps.st === 3 || ps.userPaused || ps.error || document.visibilityState === 'hidden') return;
+      setPs({ pass: true, autoPass: true });
+    }, 2000);
+  }, 2500);
 }
 
 export function setMode(mode) {
@@ -296,6 +345,7 @@ export function setMode(mode) {
 export function close() {
   saveNow(true);
   clearNext();
+  clearTimeout(kickTimer);
   want = null;
   try { player?.stopVideo(); } catch (_) { /* 何もしない */ }
   if (ps.fs) exitFs();
@@ -306,8 +356,14 @@ export function togglePlay() {
   if (!player) return;
   if (ps.upNext) clearNext();
   try {
-    if (ps.st === 1 || ps.st === 3) player.pauseVideo();
-    else player.playVideo();
+    if (ps.st === 1 || ps.st === 3) {
+      setPs({ userPaused: true });
+      player.pauseVideo();
+    } else {
+      setPs({ userPaused: false });
+      player.playVideo();
+      kick(ps.id);
+    }
   } catch (_) { /* 準備中 */ }
 }
 export function seekTo(sec) {
@@ -347,13 +403,20 @@ export function setPass(on) {
 }
 
 // ------------------------------------------------------------------ 全画面
-export function enterFs() {
+let fsTipShown = false;
+export function enterFs(fromRotate = false) {
   setPs({ fs: true });
   const el = document.documentElement;
+  const can = !!el.requestFullscreen && !fromRotate;
   try {
-    const p = el.requestFullscreen?.({ navigationUI: 'hide' });
+    const p = can ? el.requestFullscreen({ navigationUI: 'hide' }) : null;
     p?.then?.(() => screen.orientation?.lock?.('landscape').catch(() => {})).catch(() => {});
   } catch (_) { /* iPhone は画面いっぱいの表示だけ */ }
+  // iPhone の Chrome・Brave は、ページから上のバーを消せない(Apple の決まり)。ホーム画面のアイコンからなら消える
+  if (IOS && !STANDALONE && !el.requestFullscreen && !fsTipShown) {
+    fsTipShown = true;
+    toast('上のバーを消すには、ホーム画面のアイコンから開いてください(iPhone のブラウザでは消せません)', 4200);
+  }
 }
 export function exitFs() {
   setPs({ fs: false });
@@ -365,6 +428,60 @@ export function exitFs() {
 document.addEventListener('fullscreenchange', () => {
   if (!document.fullscreenElement && ps.fs) setPs({ fs: false });
 });
+// スマホを横にしたら全画面、縦に戻したら元に戻す(YouTube アプリと同じ)
+try {
+  const mq = matchMedia('(orientation: landscape)');
+  mq.addEventListener('change', () => {
+    if (!PHONE || !ps.id || ps.mode !== 'full') return;
+    if (mq.matches && !ps.fs) enterFs(true);
+    else if (!mq.matches && ps.fs && !document.fullscreenElement) exitFs();
+  });
+} catch (_) { /* 古いブラウザ */ }
+// 全画面で、画面の向きが縦に固定されているときは、動画だけ横に回して出す(YouTube アプリと同じ)
+export function fsRotated() {
+  return ps.fs && PHONE && innerHeight > innerWidth;
+}
+
+// ------------------------------------------------------------------ ロック画面・コントロールセンターの表示と操作
+export function mediaMeta() {
+  const ms = navigator.mediaSession;
+  if (!ms || !ps.id) return;
+  try {
+    const info = videoInfo(ps.id);
+    let vd = null;
+    try { vd = player?.getVideoData?.(); } catch (_) { /* 準備中 */ }
+    const ok = vd && vd.video_id === ps.id;
+    ms.metadata = new MediaMetadata({
+      title: info.title || (ok && vd.title) || 'つづきから',
+      artist: info.cht || (ok && vd.author) || '',
+      album: 'つづきから',
+      artwork: [
+        { src: `https://i.ytimg.com/vi/${ps.id}/mqdefault.jpg`, sizes: '320x180', type: 'image/jpeg' },
+        { src: `https://i.ytimg.com/vi/${ps.id}/hqdefault.jpg`, sizes: '480x360', type: 'image/jpeg' },
+      ],
+    });
+  } catch (_) { /* 対応していない */ }
+}
+function mediaState() {
+  const ms = navigator.mediaSession;
+  if (!ms) return;
+  try {
+    ms.playbackState = ps.st === 1 || ps.st === 3 ? 'playing' : ps.id ? 'paused' : 'none';
+  } catch (_) { /* 対応していない */ }
+}
+(() => {
+  const ms = navigator.mediaSession;
+  if (!ms) return;
+  const h = (a, f) => {
+    try { ms.setActionHandler(a, f); } catch (_) { /* その操作は無い */ }
+  };
+  h('play', () => { setPs({ userPaused: false }); try { player?.playVideo(); } catch (_) {} });
+  h('pause', () => { setPs({ userPaused: true }); try { player?.pauseVideo(); } catch (_) {} });
+  h('previoustrack', () => { if (ps.mode !== 'short') playPrev(); });
+  h('nexttrack', () => { if (ps.mode !== 'short' && nextCandidate()) playNext(); });
+  h('seekbackward', () => seekBy(-10));
+  h('seekforward', () => seekBy(10));
+})();
 
 // ------------------------------------------------------------------ 次の動画
 let nextTimer = 0;
@@ -457,9 +574,10 @@ function PlayerSheet() {
   const id = usePlayer((p) => p.id);
   const time = usePlayer((p) => p.time);
   const autoNext = useSyncExternalStore(subscribeApp, () => appState().prefs.autoNext);
+  const fs = usePlayer((p) => p.fs);
   if (!page) return null;
   const done = () => setPage(null);
-  return html`<div class="sheet-bg pl-sheet" onClick=${done}>
+  return html`<div class=${clsx('sheet-bg pl-sheet', fs && fsRotated() && 'rot')} onClick=${done}>
     <div class="sheet" onClick=${(e) => e.stopPropagation()}>
       <div class="sheet-grip"></div>
       ${page === 'main' && html`
@@ -486,6 +604,7 @@ function Controls() {
   const fs = usePlayer((p) => p.fs);
   const pass = usePlayer((p) => p.pass);
   const started = usePlayer((p) => p.started);
+  const autoPass = usePlayer((p) => p.autoPass);
   const err = usePlayer((p) => p.error);
   const id = usePlayer((p) => p.id);
   const live = usePlayer((p) => p.live);
@@ -525,9 +644,12 @@ function Controls() {
   }, [playing]);
 
   // 指の動き: 下へ → 小さくする / 上へ → 全画面 / 全画面で下へ → 戻す / 長押し → 2倍速
+  // 画面に対する指の位置を、動画の向きでの位置に直す(全画面で横に回しているとき)
+  const local = (e) => (fsRotated() ? { x: e.clientY, y: -e.clientX } : { x: e.clientX, y: e.clientY });
   const onDown = (e) => {
     if (e.target.closest('button, input, a, .pc-err, .pc-next')) return;
-    const s = { x: e.clientX, y: e.clientY, moved: false, drag: false, long: false, dy: 0 };
+    const l = local(e);
+    const s = { x: l.x, y: l.y, moved: false, drag: false, long: false, dy: 0 };
     s.lt = setTimeout(() => {
       if (!s.moved && getPs().st === 1) {
         s.long = true;
@@ -543,8 +665,9 @@ function Controls() {
   const onMove = (e) => {
     const s = g.current;
     if (s.x == null) return;
-    const dx = e.clientX - s.x;
-    const dy = e.clientY - s.y;
+    const l = local(e);
+    const dx = l.x - s.x;
+    const dy = l.y - s.y;
     if (!s.moved && Math.hypot(dx, dy) > 10) {
       s.moved = true;
       clearTimeout(s.lt);
@@ -552,7 +675,10 @@ function Controls() {
     }
     if (s.drag) {
       s.dy = dy;
-      if (!getPs().fs) document.documentElement.style.setProperty('--wdrag', Math.max(0, dy) + 'px');
+      if (!getPs().fs) {
+        document.documentElement.classList.add('wdrag');
+        document.documentElement.style.setProperty('--wdrag', Math.max(0, dy) + 'px');
+      }
     }
   };
   const onUp = (e, cancel) => {
@@ -567,6 +693,7 @@ function Controls() {
     } else if (s.drag) {
       s.suppress = true;
       document.documentElement.style.removeProperty('--wdrag');
+      document.documentElement.classList.remove('wdrag');
       if (cancel) return;
       const fsNow = getPs().fs;
       if (!fsNow && s.dy > 90) leaveWatch();
@@ -582,7 +709,7 @@ function Controls() {
     }
     if (e.target.closest('button, input, a')) return;
     const rect = e.currentTarget.getBoundingClientRect();
-    const x = (e.clientX - rect.left) / rect.width;
+    const x = fsRotated() ? (e.clientY - rect.top) / rect.height : (e.clientX - rect.left) / rect.width;
     const now = Date.now();
     const tr = tapRef.current;
     if (now - tr.t < 300 && Math.abs(x - tr.x) < 0.25) {
@@ -609,9 +736,10 @@ function Controls() {
 
   if (pass) {
     return html`<div class="pc-pass">
-      ${!started && !err
-        ? html`<div class="pc-hint">動画の ▶ を押して再生</div>`
+      ${(!started || autoPass) && !err
+        ? html`<div class="pc-hint">動画の ▶ を直接押して再生</div>`
         : html`<button class="pc-chip pc-back" onClick=${() => setPass(false)}>操作ボタンに戻す</button>`}
+      ${fs && html`<button class="pc-chip pc-fsx" onClick=${exitFs}>全画面をやめる</button>`}
     </div>`;
   }
 
@@ -703,7 +831,13 @@ export function PlayerShell() {
   const hostRef = useRef(null);
   const prevMode = useRef(mode);
   const [enter, setEnter] = useState(false);
+  const [, setVp] = useState(0);
   const mg = useRef({});
+  useEffect(() => {
+    const f = () => setVp((x) => x + 1);
+    addEventListener('resize', f);
+    return () => removeEventListener('resize', f);
+  }, []);
   useEffect(() => {
     attachHost(hostRef.current);
     // 箱が付き直したとき: 古いプレーヤーは捨て、頼まれていた動画があれば作る
@@ -714,6 +848,11 @@ export function PlayerShell() {
     }
     return () => attachHost(null);
   }, []);
+  // 回した全画面のときは、お知らせも回して出す(CSS の body.fs-rot)
+  const rot = fs && fsRotated();
+  useEffect(() => {
+    document.body.classList.toggle('fs-rot', !!rot);
+  }, [rot]);
   // 小さい窓 → 再生画面 のときだけ、下からせり上がる
   useEffect(() => {
     const was = prevMode.current;
@@ -750,7 +889,7 @@ export function PlayerShell() {
     else if (dy > 40) close();
   };
   return html`<${React.Fragment}>
-    <div class=${clsx('ph', fs ? 'fs' : mode, enter && 'enter')} aria-hidden=${mode === 'none' ? 'true' : 'false'}
+    <div class=${clsx('ph', fs ? 'fs' : mode, enter && 'enter', fs && fsRotated() && 'rot')} aria-hidden=${mode === 'none' ? 'true' : 'false'}
       onPointerDown=${mini ? mDown : null} onPointerMove=${mini ? mMove : null} onPointerUp=${mini ? mUp : null} onPointerCancel=${mini ? mUp : null}
       onClickCapture=${mini ? (e) => { if (mg.current.justMoved) { e.stopPropagation(); e.preventDefault(); } } : null}>
       <div class="ph-video">

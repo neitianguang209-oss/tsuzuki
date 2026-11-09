@@ -13,6 +13,7 @@ const DEFAULT_PREFS = { shorts: true, autoNext: true, rate: 1, morningHour: 6, h
 const cache = lsGetJson(CACHE, null);
 let state = {
   booted: false,
+  resyncing: false, // しばらく閉じていたあと開き直して、読み込み直している最中
   needKey: !getKey(),
   syncing: false,
   refreshing: false,

@@ -263,7 +263,6 @@ export function TopBar({ route }) {
 }
 
 export function BottomNav({ route }) {
-  if (route.name === 'watch') return null;
   const tab = (name, href, on, off, label) => {
     const sel = route.tab === name;
     return html`<a class=${clsx('tab', sel && 'on')} href=${href} onClick=${() => { if (sel) scrollTo({ top: 0, behavior: 'smooth' }); }}>
@@ -336,16 +335,99 @@ export function Home() {
     </${Empty}>`;
   }
   return html`<div class="page">
-    <${Chips} value=${chip} onChange=${setChip} items=${[['all', 'すべて'], ['morning', `けさの便${morningLeft.length ? ' ' + morningLeft.length : ''}`], ['unwatched', '未視聴'], ['continue', '続きから']]} />
+    <${Chips} value=${chip} onChange=${setChip} items=${[['all', 'すべて'], ['music', '音楽'], ['morning', `けさの便${morningLeft.length ? ' ' + morningLeft.length : ''}`], ['unwatched', '未視聴'], ['continue', '続きから']]} />
+    ${chip === 'music' && html`<${MusicView} feed=${long} />`}
     ${chip === 'all' && html`
       ${morning.length > 0 && html`<${MorningBox} items=${morning} left=${morningLeft} end=${end} />`}
       ${cont.length > 0 && html`<${Shelf} title="続きから見る">${cont.map((v) => html`<${VideoCard} key=${v.id} v=${v} variant="shelf" queue=${cont.map((x) => x.id)} />`)}</${Shelf}>`}
     `}
     ${chip === 'morning' && html`<div class="morning-head">${fmtDay(end)} ${prefs.morningHour}時の便 ・ ${fmtDay(start).replace(/\(.\)/, '')} ${prefs.morningHour}時から届いた ${morning.length} 本</div>`}
-    ${list.length === 0
+    ${chip === 'music' ? null : list.length === 0
       ? html`<${Empty}>${chip === 'continue' ? '途中まで見た動画はありません' : chip === 'morning' ? 'けさの便に入った動画はありません' : '動画がありません'}</${Empty}>`
       : html`<div class="grid"><${Paged} items=${items} resetKey=${chip} render=${(v) =>
           v.kind === 'shorts' ? html`<div class="grid-full" key="__shorts"><${ShortsShelf} items=${shorts} /></div>` : html`<${VideoCard} key=${v.id} v=${v} queue=${ids} />`} /></div>`}
+  </div>`;
+}
+
+// ------------------------------------------------------------------ 音楽
+// 登録チャンネルの新着から音楽らしいもの + YouTube 検索でそろえた棚。「すべて再生」で続けて流せる(作業中・寝る前に)
+const MUSIC_TITLE = /(\bMV\b|M\/V|Music Video|ミュージックビデオ|Official (Video|Audio|Lyric)|Lyric Video|リリック|THE FIRST TAKE|歌ってみた|弾き語り|\bcover\b|カバー|feat\.|\bLive at\b|ライブ映像|主題歌|\bAudio\b|Official Music|新曲|作業用BGM|\bBGM\b|ピアノ|Piano)/i;
+const MUSIC_CH = /(Official|VEVO|Records|Music|ミュージック|THE FIRST TAKE| - Topic|Topic$|レコード|ソニー|エイベックス|avex)/i;
+const MUSIC_SHELVES = [
+  { key: 'new', title: '新着ミュージックビデオ', q: 'MV 新曲', sp: 'EgQIAxAB' },
+  { key: 'jpop', title: '人気の J-POP', q: 'J-POP 人気曲 MV', sp: 'EgIQAQ==' },
+  { key: 'ftt', title: 'THE FIRST TAKE', q: 'THE FIRST TAKE', sp: 'EgQIBBAB' },
+  { key: 'utatte', title: '歌ってみた', q: '歌ってみた 人気', sp: 'EgIQAQ==' },
+  { key: 'bgm', title: '作業用 BGM', q: '作業用BGM', sp: 'EgIQAQ==' },
+  { key: 'piano', title: 'ピアノ・ゆったり', q: 'ピアノ BGM 癒し', sp: 'EgIQAQ==' },
+];
+const MUSIC_CACHE = 'tsuzuki:music';
+// 戻り値: null(読み込み中) / 動画の配列 / { error: true }
+function useMusicShelf(sh, retry) {
+  const [items, setItems] = useState(() => {
+    const c = lsGetJson(MUSIC_CACHE, {})[sh.key];
+    return c && c.items?.length ? c.items : null;
+  });
+  useEffect(() => {
+    if (Array.isArray(items)) rememberHits(items);
+    const c = lsGetJson(MUSIC_CACHE, {})[sh.key];
+    if (c && c.items?.length && Date.now() - c.at < 6 * 3600e3) return; // 6時間は前の結果を使う
+    let off = false;
+    if (!Array.isArray(items)) setItems(null);
+    fn('search', { q: sh.q, sp: sh.sp })
+      .then((d) => {
+        if (!Array.isArray(d?.videos)) throw new Error('bad');
+        rememberHits(d.videos);
+        const list = d.videos.filter((v) => !v.live && (!v.dur || v.dur < 3 * 3600)).slice(0, 20);
+        if (list.length) {
+          // 0本のときは覚えない(次に開いたときに取り直す)
+          const now = lsGetJson(MUSIC_CACHE, {});
+          now[sh.key] = { at: Date.now(), items: list };
+          lsSetJson(MUSIC_CACHE, now);
+        }
+        if (!off) setItems(list);
+      })
+      .catch(() => !off && setItems((x) => (Array.isArray(x) && x.length ? x : { error: true })));
+    return () => { off = true; };
+  }, [sh.key, retry]);
+  return items;
+}
+function MusicShelf({ sh, raw }) {
+  if (raw && (raw.error || !raw.length)) return null;
+  const items = (raw || []).map(fromHit);
+  const ids = items.map((v) => v.id);
+  return html`<section class="shelf">
+    <div class="shelf-h"><h2>${sh.title}</h2><span class="sp"></span>
+      ${ids.length > 0 && html`<button class="btn sm outline" onClick=${() => play(ids[0], ids)}><${Icon} d=${P.IC.play} size=${16} />すべて再生</button>`}
+    </div>
+    <div class="shelf-row">${raw ? items.map((v) => html`<${VideoCard} key=${v.id} v=${v} variant="shelf" queue=${ids} />`)
+      : [0, 1, 2].map((i) => html`<div key=${i} class="vsh"><div class="th sk"></div><div class="sk-line"></div></div>`)}</div>
+  </section>`;
+}
+function MusicView({ feed }) {
+  const [retry, setRetry] = useState(0);
+  // 棚の数は決まっているので、フックを並べて呼んでよい
+  const shelves = MUSIC_SHELVES.map((sh) => [sh, useMusicShelf(sh, retry)]);
+  const mine = feed.filter((v) => !v.live && (MUSIC_TITLE.test(v.title || '') || MUSIC_CH.test(v.cht || '')));
+  const ids = mine.map((v) => v.id);
+  const settled = shelves.every(([, r]) => r !== null);
+  const anyItems = shelves.some(([, r]) => Array.isArray(r) && r.length);
+  const anyErr = shelves.some(([, r]) => r && r.error);
+  if (!mine.length && settled && !anyItems) {
+    return html`<${Empty}>
+      <p>${anyErr ? (navigator.onLine === false ? 'オフラインのため、音楽を読み込めませんでした' : '音楽を読み込めませんでした') : '音楽の動画が見つかりませんでした'}</p>
+      <button class="btn" onClick=${() => setRetry((x) => x + 1)}>もう一度</button>
+    </${Empty}>`;
+  }
+  return html`<div class="music">
+    <p class="music-lead">登録チャンネルの曲と、みんなが聴いている曲。「すべて再生」で続けて流れます。</p>
+    ${mine.length > 0 && html`<section class="shelf">
+      <div class="shelf-h"><h2>登録チャンネルの音楽</h2><span class="sp"></span>
+        <button class="btn sm outline" onClick=${() => play(ids[0], ids)}><${Icon} d=${P.IC.play} size=${16} />すべて再生</button></div>
+      <div class="shelf-row">${mine.slice(0, 30).map((v) => html`<${VideoCard} key=${v.id} v=${v} variant="shelf" queue=${ids} />`)}</div>
+    </section>`}
+    ${shelves.map(([sh, raw]) => html`<${MusicShelf} key=${sh.key} sh=${sh} raw=${raw} />`)}
+    ${anyErr && html`<div class="center"><button class="btn sm ghost" onClick=${() => setRetry((x) => x + 1)}>読み込めなかった棚をもう一度</button></div>`}
   </div>`;
 }
 
@@ -371,7 +453,9 @@ function MorningBox({ items, left, end }) {
 export function ShortsPage({ id }) {
   const subShorts = useSubShorts(30);
   const st = P.usePlayer((p) => p.st);
-  const started = P.usePlayer((p) => p.started);
+  const started0 = P.usePlayer((p) => p.started);
+  const autoPass = P.usePlayer((p) => p.autoPass);
+  const started = started0 && !autoPass;
   const pid = P.usePlayer((p) => p.id);
   const pmode = P.usePlayer((p) => p.mode);
   const [list] = useState(() => {
@@ -416,7 +500,7 @@ export function ShortsPage({ id }) {
         ${Math.abs(i - cur) <= 2 && html`<img class="sh-th" src=${`https://i.ytimg.com/vi/${v.id}/oar2.jpg`} alt="" onError=${(e) => { e.currentTarget.src = thumb(v.id, 'hqdefault'); }} />`}
         <div class=${clsx('sh-tap', active && !started && 'through')} onClick=${() => i === cur && P.togglePlay()}></div>
         ${active && st === 2 && html`<div class="sh-paused"><${Icon} d=${P.IC.play} size=${56} /></div>`}
-        ${active && !started && html`<div class="pc-hint sh-hint">動画の ▶ を押して再生</div>`}
+        ${active && !started && html`<div class="pc-hint sh-hint">動画の ▶ を直接押して再生</div>`}
         <div class="sh-side">
           <button class="sh-btn" onClick=${() => toggleLater({ ...info, short: true })}><${Icon} d=${getState().later.some((l) => l.id === v.id) ? I.saved : I.save} size=${28} /><span>保存</span></button>
           <button class="sh-btn" onClick=${() => openSheet({ ...info, short: true })}><${Icon} d=${I.share} size=${28} /><span>共有</span></button>
@@ -465,12 +549,15 @@ export function Subs({ chId }) {
   const items = showShorts ? [...list.slice(0, 2), { kind: 'shorts', id: '__shorts' }, ...list.slice(2)] : list;
   const sel = chId ? chById(chId) : null;
   return html`<div class="page">
-    <div class="ch-strip">
-      ${sorted.map((c) => html`<a key=${c.id} class=${clsx('ch-dot', chId === c.id && 'on', chId && chId !== c.id && 'off')} href=${chId === c.id ? '#/subs' : `#/subs/${c.id}`}>
-        <${Avatar} src=${c.avatar} title=${c.title} size=${56} />
-        <span>${c.title || '…'}</span>
-      </a>`)}
-      <a class="ch-dot all" href="#/channels"><span class="all-txt">すべて</span></a>
+    <div class="ch-strip-wrap">
+      <div class="ch-strip">
+        ${sorted.map((c) => html`<a key=${c.id} class=${clsx('ch-dot', chId === c.id && 'on', chId && chId !== c.id && 'off')} href=${chId === c.id ? '#/subs' : `#/subs/${c.id}`}>
+          <${Avatar} src=${c.avatar} title=${c.title} size=${56} />
+          <span>${c.title || '…'}</span>
+          ${latest.get(c.id) && Date.now() - new Date(latest.get(c.id)) < 864e5 && html`<i class="ch-new"></i>`}
+        </a>`)}
+      </div>
+      <a class="ch-all" href="#/channels">すべて</a>
     </div>
     <${Chips} value=${chip} onChange=${setChip} items=${[['all', 'すべて'], ['today', '今日'], ['videos', '動画'], ['shorts', 'ショート'], ['live', 'ライブ'], ['unwatched', '未視聴'], ['continue', '続きを見る']]} />
     ${sel && html`<div class="sel-ch"><b>${sel.title}</b><span class="sp"></span><a class="link" href=${`#/c/${sel.id}`}>チャンネルを表示</a></div>`}
@@ -489,6 +576,8 @@ export function Channels() {
   const channels = useStore((s) => s.channels);
   const videos = useStore((s) => s.videos);
   const [q, setQ] = useState('');
+  const [sort, setSort] = useState(() => sessionStorage.getItem('tz:chsort') || 'new');
+  useEffect(() => { try { sessionStorage.setItem('tz:chsort', sort); } catch (_) {} }, [sort]);
   const latest = useMemo(() => {
     const m = new Map();
     for (const v of videos) if (!m.has(v.ch)) m.set(v.ch, v.pub);
@@ -496,13 +585,18 @@ export function Channels() {
   }, [videos]);
   const list = channels
     .filter((c) => !q || (c.title || '').toLowerCase().includes(q.toLowerCase()))
-    .sort((a, b) => (a.title || '').localeCompare(b.title || '', 'ja'));
+    .sort((a, b) => sort === 'az'
+      ? (a.title || '').localeCompare(b.title || '', 'ja')
+      : new Date(latest.get(b.id) || 0) - new Date(latest.get(a.id) || 0));
   return html`<div class="page pad">
     <div class="row gap">
       <input class="field" placeholder="チャンネルを絞り込む" value=${q} onInput=${(e) => setQ(e.target.value)} />
       <a class="btn" href="#/add"><${Icon} d=${I.plus} size=${18} />追加</a>
     </div>
-    <p class="note">${channels.length} チャンネル</p>
+    <div class="row gap ch-sort">
+      <span class="note">${channels.length} チャンネル</span><span class="sp"></span>
+      ${[['new', '新しい動画順'], ['az', '名前順']].map(([k, label]) => html`<button key=${k} class=${clsx('chip', sort === k && 'on')} onClick=${() => setSort(k)}>${label}</button>`)}
+    </div>
     ${list.map((c) => html`<div key=${c.id} class="ch-row">
       <a class="ch-row-main" href=${`#/c/${c.id}`}>
         <${Avatar} src=${c.avatar} title=${c.title} size=${44} />
@@ -887,6 +981,7 @@ export function Watch({ id }) {
       fn('video', { id })
         .then((d) => {
           rememberDetail(id, d);
+          if (P.getPs().id === id) P.mediaMeta();
           rememberHits(d.related);
           if (!off) setDetail(d);
         })
@@ -1048,6 +1143,7 @@ export function Settings() {
         </select>
       </label>
     </div>
+    <${HowTo} />
     <h2 class="sec-h">データ</h2>
     <div class="list-box">
       <button class="li" onClick=${refreshFeed}><${Icon} d=${I.refresh} /><span>新着をいますぐ取り込む</span></button>
@@ -1060,6 +1156,24 @@ export function Settings() {
       <p>広告を消す仕組みは入れていません(YouTube の決まりで禁止のため)。広告をふせぎたいときは、広告ブロックつきのブラウザ(Brave など)でこのページを開いてください。</p>
     </div>
   </div>`;
+}
+
+// 開いているブラウザに合わせた使い方(全画面・画面を消して聴く)
+function HowTo() {
+  const [brave, setBrave] = useState(false);
+  useEffect(() => {
+    try { navigator.brave?.isBrave?.().then((b) => setBrave(!!b)).catch(() => {}); } catch (_) { /* 何もしない */ }
+  }, []);
+  const where = P.STANDALONE ? 'ホーム画面のアイコン' : brave ? 'Brave' : /CriOS/.test(navigator.userAgent) ? 'Chrome' : 'ブラウザ';
+  return html`<h2 class="sec-h">使い方のこつ</h2>
+    <div class="list-box howto">
+      <div class="li"><span>いま開いている場所</span><span class="sp"></span><b>${where}</b></div>
+      <div class="li col"><b>上のバーを消して全画面にする</b>
+        <span>${P.IOS && !P.STANDALONE ? 'iPhone の Chrome・Brave では、ページから上のバーを消せません(Apple の決まり)。Brave・Chrome の共有メニュー →「ホーム画面に追加」で作ったアイコンから開くと、バーのない全画面になります。' : '動画の右下の全画面ボタン、またはスマホを横にすると全画面になります。'}</span></div>
+      <div class="li col"><b>画面を消しても音を流す(バックグラウンド再生)</b>
+        <span>Brave: 設定 → 「メディア」の「バックグラウンド再生(Background Audio)」をオンにすると、Brave で開いたときに画面を消しても続きます。</span>
+        <span>Chrome・ホーム画面のアイコン: 画面を消すと止まります。ロック画面やコントロールセンターの ▶ を押すと、続きから流れることがあります。</span></div>
+    </div>`;
 }
 
 export function HistoryPage() {
