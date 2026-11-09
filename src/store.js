@@ -397,7 +397,7 @@ export function videoInfo(id) {
     ptxt: d?.ptxt || h?.ptxt || '',
     pub: v?.pub || null,
     views: v?.views || 0,
-    short: !!v?.short,
+    short: !!(v?.short || h?.short),
     live: !!(v?.live || h?.live || d?.live),
   };
 }

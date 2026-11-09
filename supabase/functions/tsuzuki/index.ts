@@ -18,6 +18,7 @@ const CTX = { client: { clientName: 'WEB', clientVersion: '2.20250101.00.00', hl
 const TAB_PARAMS: Record<string, string> = {
   videos: 'EgZ2aWRlb3PyBgQKAjoA',
   streams: 'EgdzdHJlYW1z8gYECgJ6AA==',
+  shorts: 'EgZzaG9ydHPyBgUKA5oBAA==',
 };
 
 function json(body: unknown, status = 200) {
@@ -85,6 +86,17 @@ type Hit = {
   live: boolean;
 };
 type ChHit = { id: string; title: string; avatar: string; handle: string; subs: string };
+type ShortHit = { id: string; title: string; vtxt: string };
+
+function fromShortLockup(x: Any): ShortHit | null {
+  const id = x?.onTap?.innertubeCommand?.reelWatchEndpoint?.videoId || String(x?.entityId || '').replace('shorts-shelf-item-', '');
+  if (!id || id.length !== 11) return null;
+  return { id, title: x.overlayMetadata?.primaryText?.content || '', vtxt: x.overlayMetadata?.secondaryText?.content || '' };
+}
+function fromReelItem(x: Any): ShortHit | null {
+  if (!x?.videoId) return null;
+  return { id: x.videoId, title: runs(x.headline), vtxt: runs(x.viewCountText) };
+}
 
 function fromVideoRenderer(v: Any): Hit | null {
   if (!v?.videoId) return null;
@@ -158,6 +170,7 @@ function fromChannelRenderer(c: Any): ChHit | null {
 function harvest(root: Any) {
   const videos: Hit[] = [];
   const channels: ChHit[] = [];
+  const shorts: ShortHit[] = [];
   let cont = '';
   const seen = new Set<string>();
   const walk = (n: Any, depth: number) => {
@@ -179,7 +192,14 @@ function harvest(root: Any) {
       if (c && !channels.some((x) => x.id === c.id)) channels.push(c);
       return;
     }
-    if (n.reelShelfRenderer || n.shortsLockupViewModel || n.reelItemRenderer) return; // ショートの棚は飛ばす
+    if (n.shortsLockupViewModel || n.reelItemRenderer) {
+      const s = n.shortsLockupViewModel ? fromShortLockup(n.shortsLockupViewModel) : fromReelItem(n.reelItemRenderer);
+      if (s && !seen.has(s.id)) {
+        seen.add(s.id);
+        shorts.push(s);
+      }
+      return;
+    }
     if (n.continuationItemRenderer) {
       const t = n.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token;
       if (t) cont = t;
@@ -191,14 +211,14 @@ function harvest(root: Any) {
     }
   };
   walk(root, 0);
-  return { videos, channels, cont };
+  return { videos, channels, shorts, cont };
 }
 
 // ------------------------------------------------------------------ 検索
 async function search(q: string, cont?: string) {
   const d = cont ? await yti('search', { continuation: cont }) : await yti('search', { query: q });
   const h = harvest(cont ? d.onResponseReceivedCommands : d.contents);
-  return { videos: h.videos, channels: h.channels, cont: h.cont };
+  return { videos: h.videos, channels: h.channels, shorts: h.shorts, cont: h.cont };
 }
 
 // ------------------------------------------------------------------ 動画の詳しい情報と関連動画
@@ -212,7 +232,17 @@ async function video(id: string) {
   const rel = harvest(res.secondaryResults);
   // コラボ動画は投稿者が「一覧の窓」の形で入っているので、中の最初のチャンネルを使う
   const os = JSON.stringify(owner);
+  // コメント: 件数は右の欄の見出し、1ページ目は続きの合図で取りに行く
+  let ccont = '';
+  for (const c of res.results?.results?.contents || []) {
+    const isr = c.itemSectionRenderer;
+    if (isr?.sectionIdentifier !== 'comment-item-section') continue;
+    for (const x of isr.contents || []) ccont = x.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token || ccont;
+  }
+  const ep = JSON.stringify((d.engagementPanels || []).filter((p: Any) => JSON.stringify(p).includes('comments-section')));
+  const ccount = (ep.match(/"contextualInfo":\{"runs":\[\{"text":"([^"]+)"/) || [])[1] || '';
   return {
+    comments: { count: ccount, cont: ccont },
     id,
     title: runs(prim.title),
     vtxt: runs(prim.viewCount?.videoViewCountRenderer?.viewCount) || runs(prim.viewCount?.videoViewCountRenderer?.shortViewCount),
@@ -235,7 +265,7 @@ async function channelPage(id: string, tab = 'videos', cont?: string) {
   if (cont) {
     const d = await yti('browse', { continuation: cont });
     const h = harvest(d.onResponseReceivedActions);
-    return { videos: h.videos, cont: h.cont };
+    return { videos: h.videos, shorts: h.shorts, cont: h.cont };
   }
   const d = await yti('browse', { browseId: id, params: TAB_PARAMS[tab] || TAB_PARAMS.videos });
   const m = d.metadata?.channelMetadataRenderer || {};
@@ -252,8 +282,59 @@ async function channelPage(id: string, tab = 'videos', cont?: string) {
       subs,
     },
     videos: h.videos,
+    shorts: h.shorts,
     cont: h.cont,
   };
+}
+
+// ------------------------------------------------------------------ コメント(読むだけ)
+async function comments(cont: string) {
+  if (!cont) return { items: [], cont: '' };
+  const d = await yti('next', { continuation: cont });
+  const items: Any[] = [];
+  for (const m of d.frameworkUpdates?.entityBatchUpdate?.mutations || []) {
+    const p = m.payload?.commentEntityPayload;
+    if (!p) continue;
+    const pr = p.properties || {};
+    if (pr.replyLevel) continue; // 返信は出さない
+    items.push({
+      id: pr.commentId || '',
+      text: pr.content?.content || '',
+      author: p.author?.displayName || '',
+      avatar: fixUrl(p.author?.avatarThumbnailUrl || ''),
+      when: pr.publishedTime || '',
+      likes: p.toolbar?.likeCountNotliked || '',
+      replies: p.toolbar?.replyCount || '',
+      owner: !!p.author?.isCreator,
+    });
+  }
+  // 次のページの合図(並び替えメニューの合図はまぜない)
+  let next = '';
+  const walk = (n: Any, depth: number) => {
+    if (!n || typeof n !== 'object' || depth > 30) return;
+    if (Array.isArray(n)) return n.forEach((x) => walk(x, depth + 1));
+    if (n.continuationItemRenderer) {
+      const c = n.continuationItemRenderer;
+      next = c.continuationEndpoint?.continuationCommand?.token || c.button?.buttonRenderer?.command?.continuationCommand?.token || next;
+      return;
+    }
+    if (n.sortFilterSubMenuRenderer) return;
+    for (const k in n) walk(n[k], depth + 1);
+  };
+  walk(d.onResponseReceivedEndpoints, 0);
+  return { items, cont: next };
+}
+
+// ------------------------------------------------------------------ 検索の候補
+async function suggest(q: string) {
+  if (!q) return { items: [] };
+  const r = await fetch(`https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&hl=ja&gl=jp&oe=utf-8&q=${encodeURIComponent(q)}`, {
+    headers: { 'User-Agent': UA },
+    signal: AbortSignal.timeout(4000),
+  });
+  if (!r.ok) return { items: [] };
+  const j = await r.json();
+  return { items: (j?.[1] || []).slice(0, 12) };
 }
 
 // URL・@ハンドル・UC… から チャンネルID を出す
@@ -469,6 +550,10 @@ Deno.serve(async (req) => {
         return json(await video(String(body.id || '')));
       case 'channel':
         return json(await channelPage(String(body.id || ''), String(body.tab || 'videos'), body.cont));
+      case 'comments':
+        return json(await comments(String(body.cont || '')));
+      case 'suggest':
+        return json(await suggest(String(body.q || '').slice(0, 100)));
       case 'resolve':
         return json({ id: await resolveChannel(String(body.url || '')) });
       case 'sub':

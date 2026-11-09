@@ -2,11 +2,11 @@ import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { html, noteRoute } from './util.js';
 import { takeKeyFromUrl } from './api.js';
-import { useStore, load, getState } from './store.js';
+import { useStore, load, getState, refreshFeed } from './store.js';
 import { PlayerShell, setMode, getPs, close as closePlayer } from './player.js';
-import { TopBar, BottomNav, Home, Subs, Channels, AddChannel, ChannelPage, Search, Watch, Me, HistoryPage, LaterPage, KeyGate, Sheet } from './views.js';
+import { TopBar, BottomNav, Home, Subs, Channels, AddChannel, ChannelPage, Search, Watch, Me, Settings, HistoryPage, LaterPage, KeyGate, Sheet, ShortsPage } from './views.js';
 
-window.TZ_VERSION = '1.0.0';
+window.TZ_VERSION = '1.1.0';
 takeKeyFromUrl();
 
 function dec(x) {
@@ -22,6 +22,8 @@ function parse(hash) {
   const [a, b] = seg;
   if (!a) return { name: 'home', tab: 'home' };
   if (a === 'w' && b) return { name: 'watch', id: b };
+  if (a === 'shorts') return { name: 'shorts', tab: 'shorts', id: b || '' };
+  if (a === 'settings') return { name: 'settings', tab: 'me', title: '設定' };
   if (a === 'subs') return { name: 'subs', tab: 'subs', chId: b || '' };
   if (a === 'channels') return { name: 'channels', tab: 'subs', title: '登録チャンネル' };
   if (a === 'add') return { name: 'add', tab: 'subs', title: 'チャンネルを追加' };
@@ -47,6 +49,57 @@ function useRoute() {
   return r;
 }
 
+// 一番上で下に引っぱると新着を取り込む(YouTube アプリと同じ)
+function PullRefresh() {
+  const refreshing = useStore((s) => s.refreshing);
+  const [pull, setPull] = useState(0);
+  useEffect(() => {
+    let y0 = null;
+    let d = 0;
+    const down = (e) => {
+      y0 = scrollY <= 0 && !e.target.closest('.shelf-row, .chips, .ch-strip, .ph, .sheet') ? e.touches[0].clientY : null;
+      d = 0;
+    };
+    const move = (e) => {
+      if (y0 == null) return;
+      d = e.touches[0].clientY - y0;
+      if (d > 0 && scrollY <= 0) setPull(Math.min(110, d * 0.5));
+      else setPull(0);
+    };
+    const up = () => {
+      if (y0 != null && d * 0.5 >= 64) refreshFeed();
+      y0 = null;
+      setPull(0);
+    };
+    addEventListener('touchstart', down, { passive: true });
+    addEventListener('touchmove', move, { passive: true });
+    addEventListener('touchend', up);
+    addEventListener('touchcancel', up);
+    return () => {
+      removeEventListener('touchstart', down);
+      removeEventListener('touchmove', move);
+      removeEventListener('touchend', up);
+      removeEventListener('touchcancel', up);
+    };
+  }, []);
+  if (!pull && !refreshing) return null;
+  const y = refreshing ? 64 : pull;
+  return html`<div class="ptr" style=${{ transform: `translate(-50%, ${y}px)`, opacity: refreshing ? 1 : Math.min(1, pull / 64) }}>
+    <span class=${refreshing ? 'spinner' : 'ptr-arrow'} style=${refreshing ? null : { transform: `rotate(${pull * 3}deg)` }}></span>
+  </div>`;
+}
+
+// 下へスクロールすると上のバーが隠れ、上へ戻すと出てくる(YouTube アプリと同じ)
+let lastY = 0;
+addEventListener('scroll', () => {
+  const y = scrollY;
+  const r = document.body.dataset.route;
+  if (r === 'watch' || r === 'shorts' || r === 'search') return;
+  if (y > lastY + 6 && y > 120) document.body.classList.add('hide-top');
+  else if (y < lastY - 6 || y < 60) document.body.classList.remove('hide-top');
+  lastY = y;
+}, { passive: true });
+
 function Toast() {
   const t = useStore((s) => s.toast);
   if (!t) return null;
@@ -60,10 +113,13 @@ function App() {
   const routeTitle = useStore((s) => s.routeTitle);
   const offline = useStore((s) => s.offline);
 
-  // 再生画面を離れたら、プレーヤーは小さい窓になる
+  // 再生画面を離れたら、プレーヤーは小さい窓になる。ショートは画面を離れたら止める
   useEffect(() => {
-    if (route.name !== 'watch' && getPs().id) setMode('mini');
+    const ps = getPs();
+    if (ps.id && ps.mode === 'short' && route.name !== 'shorts') closePlayer();
+    else if (route.name !== 'watch' && route.name !== 'shorts' && ps.id) setMode('mini');
     document.body.dataset.route = needKey ? 'gate' : route.name;
+    document.body.classList.remove('hide-top');
   }, [route.name, needKey]);
   // 合言葉の画面に入るときは、流していた動画を止める(プレーヤーの箱は外さない)
   useEffect(() => {
@@ -80,6 +136,8 @@ function App() {
     case 'channel': page = html`<${ChannelPage} key=${route.id} id=${route.id} />`; break;
     case 'search': page = html`<${Search} q=${route.q} />`; break;
     case 'me': page = html`<${Me} />`; break;
+    case 'settings': page = html`<${Settings} />`; break;
+    case 'shorts': page = html`<${ShortsPage} key=${'shorts'} id=${route.id} />`; break;
     case 'history': page = html`<${HistoryPage} />`; break;
     case 'later': page = html`<${LaterPage} />`; break;
     default: page = html`<${Home} />`;
@@ -88,7 +146,8 @@ function App() {
   return html`<div class="app">
     ${!needKey && html`<${TopBar} route=${{ ...route, title }} />`}
     ${offline && !needKey && html`<div class="offline">オフラインです。前回の内容を表示しています</div>`}
-    <main class="main">${!needKey && !booted && !getState().channels.length ? html`<div class="loading">読み込み中…</div>` : page}</main>
+    ${!needKey && (route.name === 'home' || route.name === 'subs') && html`<${PullRefresh} />`}
+    <main class="main">${!needKey && !booted && !getState().channels.length ? html`<div class="loading"><span class="spinner"></span></div>` : page}</main>
     <${PlayerShell} />
     ${!needKey && html`<${BottomNav} route=${route} />`}
     <${Sheet} />
