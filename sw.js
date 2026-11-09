@@ -1,6 +1,6 @@
 // Service Worker(手書き・ビルド不要)。全パスは相対(GitHub Pages のサブパス配信で壊れないように)。
 // アプリを更新して公開するたび、毎回 CACHE_NAME の数字を上げる(上げないと古い画面が出続ける)。
-const CACHE_NAME = 'tsuzuki-v3';
+const CACHE_NAME = 'tsuzuki-v4';
 const APP_SHELL = [
   './',
   './index.html',
@@ -12,6 +12,7 @@ const APP_SHELL = [
   './src/store.js',
   './src/player.js',
   './src/views.js',
+  './src/reco.js',
   './icons/icon-192.png',
   './icons/icon-180.png',
   './icons/favicon-32.png',

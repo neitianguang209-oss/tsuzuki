@@ -6,6 +6,7 @@ import {
 } from './store.js';
 import { fn, setKey } from './api.js';
 import * as P from './player.js';
+import { useAffinity, useRankBasis, rankFeed, rankChannels, useDiscover } from './reco.js';
 
 const Icon = P.Icon;
 // 下のタブの絵は、選んでいないときは線だけ・選んだときは塗りつぶし(YouTube アプリと同じ)
@@ -233,7 +234,8 @@ export function Sheet() {
       <button class="sheet-i" onClick=${() => { toggleLater(info); done(); }}><${Icon} d=${later ? I.saved : I.later} /><span>${later ? '「後で見る」から削除' : '「後で見る」に保存'}</span></button>
       <button class="sheet-i" onClick=${share}><${Icon} d=${I.share} /><span>共有</span></button>
       ${info.chId && html`<button class="sheet-i" onClick=${() => { location.hash = `#/c/${info.chId}`; done(); }}><${Icon} d=${I.person} /><span>チャンネルに移動</span></button>`}
-      ${inFeed && html`<button class="sheet-i" onClick=${() => { hideVideo(v.id); toast('この動画は今後表示されません'); done(); }}><${Icon} d=${I.hide} /><span>興味なし</span></button>`}
+      ${(inFeed || v.rec) && html`<button class="sheet-i" onClick=${() => { hideVideo(v.id); toast('この動画は今後表示されません'); done(); }}><${Icon} d=${I.hide} /><span>興味なし</span></button>`}
+      ${v.rec && info.chId && html`<button class="sheet-i" onClick=${() => { const cur = getState().prefs.noRecCh || []; setPref('noRecCh', [...cur.filter((x) => x !== info.chId), info.chId]); toast('このチャンネルはおすすめに出しません'); done(); }}><${Icon} d=${I.hide} /><span>チャンネルをおすすめに表示しない</span></button>`}
       ${inHist && html`<button class="sheet-i" onClick=${() => { deleteHistory(v.id); done(); }}><${Icon} d=${I.trash} /><span>再生履歴から削除</span></button>`}
       <a class="sheet-i" href=${url} target="_blank" rel="noopener" onClick=${done}><${Icon} d=${I.open} /><span>YouTube で開く</span></a>
     </div>
@@ -314,6 +316,9 @@ export function Home() {
   const nch = useStore((s) => s.channels.length);
   const subShorts = useSubShorts(5);
   const [chip, setChip] = useState(() => sessionStorage.getItem('tz:chip') || 'all');
+  const basis = useRankBasis(chip);
+  const aff = useAffinity(basis);
+  const disc = useDiscover(basis, aff);
   useEffect(() => { try { sessionStorage.setItem('tz:chip', chip); } catch (_) {} }, [chip]);
 
   const long = feed.filter((v) => !v.short);
@@ -323,7 +328,21 @@ export function Home() {
   const shorts = prefs.shorts ? subShorts.slice(0, 12) : [];
   const cont = continueItems(progress);
   const unwatched = long.filter((v) => !progress[v.id]);
-  const list = chip === 'morning' ? morning : chip === 'unwatched' ? unwatched : chip === 'continue' ? cont : long;
+  // 「すべて」= おすすめ順(よく見るチャンネル・新しさ・まだ見ていないか)+ 最近見た動画の関連から拾ったおすすめを混ぜる
+  const ranked = useMemo(() => (chip === 'all' ? rankFeed(long, aff, basis.progress) : []), [chip, feed, aff, basis]);
+  const mixed = useMemo(() => {
+    if (chip !== 'all') return [];
+    const recs = disc.map((h) => ({ ...fromHit(h), rec: true }));
+    const out = [];
+    let r = 0;
+    ranked.forEach((v, i) => {
+      out.push(v);
+      if (i % 3 === 1 && r < recs.length) out.push(recs[r++]); // 3本に1本くらい
+    });
+    while (r < recs.length && out.length < 12) out.push(recs[r++]);
+    return out;
+  }, [chip, ranked, disc]);
+  const list = chip === 'all' ? mixed : chip === 'morning' ? morning : chip === 'unwatched' ? unwatched : chip === 'continue' ? cont : long;
   const ids = list.filter((v) => !v.live).map((v) => v.id);
   // 「すべて」のときは、YouTube と同じく動画3本のあとにショートの棚をはさむ
   const items = chip === 'all' && shorts.length ? [...list.slice(0, 3), { kind: 'shorts', id: '__shorts' }, ...list.slice(3)] : list;
@@ -335,7 +354,7 @@ export function Home() {
     </${Empty}>`;
   }
   return html`<div class="page">
-    <${Chips} value=${chip} onChange=${setChip} items=${[['all', 'すべて'], ['music', '音楽'], ['morning', `けさの便${morningLeft.length ? ' ' + morningLeft.length : ''}`], ['unwatched', '未視聴'], ['continue', '続きから']]} />
+    <${Chips} value=${chip} onChange=${setChip} items=${[['all', 'すべて'], ['new', '新着'], ['music', '音楽'], ['morning', `けさの便${morningLeft.length ? ' ' + morningLeft.length : ''}`], ['unwatched', '未視聴'], ['continue', '続きから']]} />
     ${chip === 'music' && html`<${MusicView} feed=${long} />`}
     ${chip === 'all' && html`
       ${morning.length > 0 && html`<${MorningBox} items=${morning} left=${morningLeft} end=${end} />`}
@@ -522,6 +541,7 @@ export function ShortsPage({ id }) {
 // ------------------------------------------------------------------ 登録チャンネル
 export function Subs({ chId }) {
   const feed = useFeed();
+  const aff = useAffinity(useRankBasis());
   const channels = useStore((s) => s.channels);
   const videos = useStore((s) => s.videos);
   const progress = useStore((s) => s.progress);
@@ -531,10 +551,8 @@ export function Subs({ chId }) {
     for (const v of videos) if (!m.has(v.ch)) m.set(v.ch, v.pub);
     return m;
   }, [videos]);
-  const sorted = useMemo(
-    () => [...channels].sort((a, b) => new Date(latest.get(b.id) || 0) - new Date(latest.get(a.id) || 0)),
-    [channels, latest],
-  );
+  // YouTube と同じく「関連度順」(よく見るチャンネルが左)
+  const sorted = useMemo(() => rankChannels(channels, aff, latest), [channels, latest, aff]);
   const mine = feed.filter((v) => !chId || v.chId === chId);
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -573,19 +591,21 @@ export function Subs({ chId }) {
 }
 
 export function Channels() {
+  const aff = useAffinity(useRankBasis());
   const channels = useStore((s) => s.channels);
   const videos = useStore((s) => s.videos);
   const [q, setQ] = useState('');
-  const [sort, setSort] = useState(() => sessionStorage.getItem('tz:chsort') || 'new');
+  const [sort, setSort] = useState(() => sessionStorage.getItem('tz:chsort') || 'rel');
   useEffect(() => { try { sessionStorage.setItem('tz:chsort', sort); } catch (_) {} }, [sort]);
   const latest = useMemo(() => {
     const m = new Map();
     for (const v of videos) if (!m.has(v.ch)) m.set(v.ch, v.pub);
     return m;
   }, [videos]);
-  const list = channels
-    .filter((c) => !q || (c.title || '').toLowerCase().includes(q.toLowerCase()))
-    .sort((a, b) => sort === 'az'
+  const hit = channels.filter((c) => !q || (c.title || '').toLowerCase().includes(q.toLowerCase()));
+  const list = sort === 'rel'
+    ? rankChannels(hit, aff, latest)
+    : hit.sort((a, b) => sort === 'az'
       ? (a.title || '').localeCompare(b.title || '', 'ja')
       : new Date(latest.get(b.id) || 0) - new Date(latest.get(a.id) || 0));
   return html`<div class="page pad">
@@ -595,7 +615,7 @@ export function Channels() {
     </div>
     <div class="row gap ch-sort">
       <span class="note">${channels.length} チャンネル</span><span class="sp"></span>
-      ${[['new', '新しい動画順'], ['az', '名前順']].map(([k, label]) => html`<button key=${k} class=${clsx('chip', sort === k && 'on')} onClick=${() => setSort(k)}>${label}</button>`)}
+      ${[['rel', '関連度順'], ['new', '新しい動画順'], ['az', '名前順']].map(([k, label]) => html`<button key=${k} class=${clsx('chip', sort === k && 'on')} onClick=${() => setSort(k)}>${label}</button>`)}
     </div>
     ${list.map((c) => html`<div key=${c.id} class="ch-row">
       <a class="ch-row-main" href=${`#/c/${c.id}`}>
@@ -1143,6 +1163,7 @@ export function Settings() {
         </select>
       </label>
     </div>
+    <${NoRecList} />
     <${HowTo} />
     <h2 class="sec-h">データ</h2>
     <div class="list-box">
@@ -1158,12 +1179,42 @@ export function Settings() {
   </div>`;
 }
 
+// 「チャンネルをおすすめに表示しない」にしたものを戻す
+function NoRecList() {
+  const list = useStore((s) => s.prefs.noRecCh) || [];
+  if (!list.length) return null;
+  const name = (id) => chById(id)?.title || lsHitName(id) || id;
+  return html`<h2 class="sec-h">おすすめに出さないチャンネル</h2>
+    <div class="list-box">
+      ${list.map((id) => html`<div key=${id} class="li"><span>${name(id)}</span><span class="sp"></span>
+        <button class="btn sm ghost" onClick=${() => setPref('noRecCh', (getState().prefs.noRecCh || []).filter((x) => x !== id))}>戻す</button></div>`)}
+    </div>`;
+}
+// おすすめの控え(関連動画)からチャンネル名を探す
+function lsHitName(chId) {
+  const d = lsGetJson('tsuzuki:disc', {});
+  for (const k of Object.keys(d)) {
+    const h = (d[k].related || []).find((x) => x.chId === chId);
+    if (h?.ch) return h.ch;
+  }
+  return '';
+}
+
 // 開いているブラウザに合わせた使い方(全画面・画面を消して聴く)
 function HowTo() {
   const [brave, setBrave] = useState(false);
   useEffect(() => {
     try { navigator.brave?.isBrave?.().then((b) => setBrave(!!b)).catch(() => {}); } catch (_) { /* 何もしない */ }
   }, []);
+  const copyBrave = async () => {
+    const url = 'brave://open-url?url=' + encodeURIComponent(location.origin + location.pathname);
+    try {
+      await navigator.clipboard.writeText(url);
+      toast('コピーしました。ショートカットの「URL を開く」に貼ってください');
+    } catch (_) {
+      prompt('このリンクをコピーしてください', url);
+    }
+  };
   const where = P.STANDALONE ? 'ホーム画面のアイコン' : brave ? 'Brave' : /CriOS/.test(navigator.userAgent) ? 'Chrome' : 'ブラウザ';
   return html`<h2 class="sec-h">使い方のこつ</h2>
     <div class="list-box howto">
@@ -1173,6 +1224,13 @@ function HowTo() {
       <div class="li col"><b>画面を消しても音を流す(バックグラウンド再生)</b>
         <span>Brave: 設定 → 「メディア」の「バックグラウンド再生(Background Audio)」をオンにすると、Brave で開いたときに画面を消しても続きます。</span>
         <span>Chrome・ホーム画面のアイコン: 画面を消すと止まります。ロック画面やコントロールセンターの ▶ を押すと、続きから流れることがあります。</span></div>
+      <div class="li col"><b>Brave で開くアイコンをホーム画面に作る</b>
+        <span>1. Brave で一度、合言葉入りのリンクを開いておく(Brave は Chrome と保存場所が別のため)</span>
+        <span>2. 下のボタンで「Brave で開くリンク」をコピー</span>
+        <span>3. iPhone の「ショートカット」アプリ → 右上の ＋ →「URL を開く」を追加し、URL のところに貼る</span>
+        <span>4. 下の名前の横の ⌄(または共有ボタン)→「ホーム画面に追加」。名前は「つづきから(音)」など、アイコンは好きな写真に</span>
+        <span>このアイコンから開くと Brave で開くので、Brave のバックグラウンド再生が効きます。全画面は Chrome のアイコン、画面を消して聴くときは Brave のアイコン、と使い分けられます。</span>
+        <button class="btn sm" onClick=${copyBrave}>Brave で開くリンクをコピー</button></div>
     </div>`;
 }
 
