@@ -1,12 +1,12 @@
 import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { html, noteRoute, setThemeBlack } from './util.js';
+import { html, noteRoute, setThemeBlack, goBack, leaveWatch, nav } from './util.js';
 import { takeKeyFromUrl } from './api.js';
 import { useStore, load, getState, setState, refreshFeed } from './store.js';
-import { PlayerShell, setMode, getPs, close as closePlayer } from './player.js';
+import { PlayerShell, setMode, getPs, close as closePlayer, STANDALONE } from './player.js';
 import { TopBar, BottomNav, Home, Subs, Channels, AddChannel, ChannelPage, Search, Watch, Me, Settings, HistoryPage, LaterPage, KeyGate, Sheet, ShortsPage } from './views.js';
 
-window.TZ_VERSION = '1.5.0';
+window.TZ_VERSION = '1.6.0';
 takeKeyFromUrl();
 
 function dec(x) {
@@ -89,16 +89,89 @@ function PullRefresh() {
   </div>`;
 }
 
+// 一覧のスクロール位置を、画面ごとに覚えておく(動画から戻ったとき、同じところから)
+const scrollPos = {};
+try { history.scrollRestoration = 'manual'; } catch (_) { /* 何もしない */ }
+const LIST_ROUTES = ['home', 'subs', 'channels', 'channel', 'search', 'me', 'history', 'later'];
+// 画面を移る瞬間(まだ前の画面のまま)に、前の画面の位置を覚える
+addEventListener('hashchange', (e) => {
+  try {
+    const old = new URL(e.oldURL).hash || '#/';
+    if (LIST_ROUTES.includes(document.body.dataset.route)) scrollPos[old] = scrollY;
+  } catch (_) { /* 何もしない */ }
+});
 // 下へスクロールすると上のバーが隠れ、上へ戻すと出てくる(YouTube アプリと同じ)
 let lastY = 0;
+let restoring = false; // 一覧の位置を戻している最中(上のバーを隠さない)
 addEventListener('scroll', () => {
   const y = scrollY;
+  if (restoring) {
+    lastY = y;
+    return;
+  }
   const r = document.body.dataset.route;
   if (r === 'watch' || r === 'shorts' || r === 'search') return;
   if (y > lastY + 6 && y > 120) document.body.classList.add('hide-top');
   else if (y < lastY - 6 || y < 60) document.body.classList.remove('hide-top');
   lastY = y;
 }, { passive: true });
+
+// ホーム画面のアイコンで開いているとき: 画面の左端から右へなぞると「戻る」(ブラウザの戻る動きの代わり)
+function EdgeBack() {
+  useEffect(() => {
+    if (!STANDALONE) return;
+    let s = null;
+    const main = () => document.querySelector('.main');
+    const down = (e) => {
+      const t = e.touches[0];
+      if (t.clientX > 18 || e.target.closest('.ph, .sheet-bg, .panel, .shorts, .tabs, input')) return;
+      if (document.querySelector('.panel, .sheet-bg')) return; // 説明・キュー・メニューを開いている間はしない
+      // 横に流せる列(棚・チップ)を動かしている途中なら、そちらを優先する
+      for (let el = e.target; el && el !== document.body; el = el.parentElement) {
+        if (el.scrollLeft > 0 && el.scrollWidth > el.clientWidth) return;
+      }
+      const r = document.body.dataset.route;
+      if (r === 'gate' || r === 'shorts' || (r === 'home' && nav.stack.length <= 1)) return;
+      s = { x: t.clientX, y: t.clientY, t: performance.now(), on: false, dx: 0 };
+    };
+    const move = (e) => {
+      if (!s) return;
+      const t = e.touches[0];
+      const dx = t.clientX - s.x;
+      const dy = t.clientY - s.y;
+      if (!s.on) {
+        if (Math.abs(dy) > 12 && Math.abs(dy) > dx) { s = null; return; }
+        if (dx > 12) s.on = true;
+      }
+      if (s.on) {
+        s.dx = Math.max(0, dx);
+        const m = main();
+        if (m) { m.style.transition = 'none'; m.style.transform = `translateX(${s.dx}px)`; }
+        document.body.classList.add('edgeback');
+      }
+    };
+    const up = () => {
+      if (!s) return;
+      const go = s.on && (s.dx > 90 || (s.dx > 40 && s.dx / Math.max(1, performance.now() - s.t) > 0.5));
+      const m = main();
+      if (m) { m.style.transition = 'transform 0.2s ease-out'; m.style.transform = ''; }
+      document.body.classList.remove('edgeback');
+      s = null;
+      if (go) (document.body.dataset.route === 'watch' ? leaveWatch() : goBack());
+    };
+    addEventListener('touchstart', down, { passive: true });
+    addEventListener('touchmove', move, { passive: true });
+    addEventListener('touchend', up);
+    addEventListener('touchcancel', up);
+    return () => {
+      removeEventListener('touchstart', down);
+      removeEventListener('touchmove', move);
+      removeEventListener('touchend', up);
+      removeEventListener('touchcancel', up);
+    };
+  }, []);
+  return null;
+}
 
 function Toast() {
   const t = useStore((s) => s.toast);
@@ -120,8 +193,31 @@ function App() {
     else if (route.name !== 'watch' && ps.id && ps.mode === 'full') setMode('mini');
     document.body.dataset.route = needKey ? 'gate' : route.name;
     document.body.classList.remove('hide-top');
+    // 一覧に戻ったら、前に見ていた位置へ(描き終わるのを少し待つ)。記録が無ければ上から
+    let tm = 0;
+    let tEnd = 0;
+    if (LIST_ROUTES.includes(route.name)) {
+      const y = scrollPos[location.hash || '#/'] || 0;
+      restoring = true;
+      lastY = y;
+      if (y > 0) {
+        let n = 0;
+        const go = () => {
+          lastY = y;
+          scrollTo(0, y);
+          if (Math.abs(scrollY - y) > 4 && ++n < 12) tm = setTimeout(go, 50);
+        };
+        tm = setTimeout(go, 0);
+      } else scrollTo(0, 0);
+      tEnd = setTimeout(() => { restoring = false; }, 700);
+    } else if (route.name !== 'watch' && route.name !== 'shorts') scrollTo(0, 0);
     setThemeBlack(!needKey && (route.name === 'watch' || route.name === 'shorts' || getPs().fs));
-  }, [route.name, needKey]);
+    return () => {
+      clearTimeout(tm);
+      clearTimeout(tEnd);
+      restoring = false;
+    };
+  }, [route, needKey]);
   // 合言葉の画面に入るときは、流していた動画を止める(プレーヤーの箱は外さない)
   useEffect(() => {
     if (needKey && getPs().id) closePlayer();
@@ -135,7 +231,7 @@ function App() {
     case 'channels': page = html`<${Channels} />`; break;
     case 'add': page = html`<${AddChannel} />`; break;
     case 'channel': page = html`<${ChannelPage} key=${route.id} id=${route.id} />`; break;
-    case 'search': page = html`<${Search} q=${route.q} />`; break;
+    case 'search': page = html`<${Search} key=${route.q || ''} q=${route.q} />`; break;
     case 'me': page = html`<${Me} />`; break;
     case 'settings': page = html`<${Settings} />`; break;
     case 'shorts': page = html`<${ShortsPage} key=${'shorts'} id=${route.id} />`; break;
@@ -153,6 +249,7 @@ function App() {
     ${!needKey && html`<${BottomNav} route=${route} />`}
     <${Sheet} />
     <${Toast} />
+    <${EdgeBack} />
   </div>`;
 }
 

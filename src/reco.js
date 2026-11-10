@@ -30,13 +30,34 @@ export function affinityOf(progress, hidden) {
 
 // 並べるための「履歴の写し」。再生中は履歴が5秒ごとに変わるので、そのたびに並びが動かないよう、
 // 画面を開いたとき・絞り込みを替えたとき・新着が届いたとき・「興味なし」にしたときだけ取り直す
+// 動画から戻ったときに並びが入れかわらないよう、写しは画面を作り直しても30分は使い回す
+const rankCache = new Map();
+export function clearRankCache() {
+  rankCache.clear();
+}
+export function dropRankCache(key) {
+  rankCache.delete(key);
+}
 export function useRankBasis(key = '') {
   const hidden = useStore((s) => s.hidden);
   const nvid = useStore((s) => s.videos.length);
   const booted = useStore((s) => s.booted);
-  const [snap, setSnap] = useState(() => ({ progress: getState().progress, hidden: getState().hidden }));
+  const fresh = () => {
+    const s = { progress: getState().progress, hidden: getState().hidden };
+    rankCache.set(key, { snap: s, at: Date.now(), nvid, hidden, booted });
+    return s;
+  };
+  const [snap, setSnap] = useState(() => {
+    const c = rankCache.get(key);
+    return c && Date.now() - c.at < 30 * 60e3 ? c.snap : fresh();
+  });
   useEffect(() => {
-    setSnap({ progress: getState().progress, hidden: getState().hidden });
+    const c = rankCache.get(key);
+    if (c && c.nvid === nvid && c.hidden === hidden && c.booted === booted && Date.now() - c.at < 30 * 60e3) {
+      if (c.snap !== snap) setSnap(c.snap);
+      return;
+    }
+    setSnap(fresh());
   }, [key, hidden, nvid, booted]);
   return snap;
 }

@@ -6,7 +6,7 @@ import {
 } from './store.js';
 import { fn, setKey } from './api.js';
 import * as P from './player.js';
-import { useAffinity, useRankBasis, rankFeed, rankChannels, useDiscover } from './reco.js';
+import { useAffinity, useRankBasis, rankFeed, rankChannels, useDiscover, clearRankCache, dropRankCache } from './reco.js';
 
 const Icon = P.Icon;
 // 下のタブの絵は、選んでいないときは線だけ・選んだときは塗りつぶし(YouTube アプリと同じ)
@@ -171,10 +171,23 @@ function ShortsShelf({ items }) {
 
 // 少しずつ表示を足す一覧
 // resetKey が変わったとき(絞り込みを替えたとき)だけ先頭の件数に戻す。再生中の描き直しでは戻さない
-function Paged({ items, render, step = 24, resetKey = '' }) {
-  const [n, setN] = useState(step);
+// 表示件数は画面を作り直しても覚えておく(動画から戻ったとき、同じ位置まで出ているように)
+const pagedMem = new Map();
+function Paged({ items, render, step = 24, resetKey = '', memKey = '' }) {
+  const mk = memKey ? memKey + '|' + resetKey : '';
+  const [n, setN] = useState(() => (mk && pagedMem.get(mk)) || step);
   const ref = useRef(null);
-  useEffect(() => setN(step), [resetKey, step]);
+  const first = useRef(true);
+  useEffect(() => {
+    if (first.current) {
+      first.current = false;
+      return;
+    }
+    setN(step);
+  }, [resetKey, step]);
+  useEffect(() => {
+    if (mk) pagedMem.set(mk, n);
+  }, [mk, n]);
   useEffect(() => {
     if (!ref.current || n >= items.length) return;
     const io = new IntersectionObserver((es) => {
@@ -232,6 +245,9 @@ export function Sheet() {
     <div class="sheet" onClick=${(e) => e.stopPropagation()}>
       <div class="sheet-grip"></div>
       <button class="sheet-i" onClick=${() => { toggleLater(info); done(); }}><${Icon} d=${later ? I.saved : I.later} /><span>${later ? '「後で見る」から削除' : '「後で見る」に保存'}</span></button>
+      ${!v.short && v.id !== P.getPs().id && html`
+        <button class="sheet-i" onClick=${() => { const r = P.queueNext(v.id); if (r === 'next') toast('次に再生します'); done(); }}><${Icon} d=${P.IC.playNext} /><span>次に再生</span></button>
+        <button class="sheet-i" onClick=${() => { const r = P.queueAdd(v.id); if (r === 'add') toast('キューに追加しました'); done(); }}><${Icon} d=${P.IC.queue} /><span>キューに追加</span></button>`}
       <button class="sheet-i" onClick=${share}><${Icon} d=${I.share} /><span>共有</span></button>
       ${info.chId && html`<button class="sheet-i" onClick=${() => { location.hash = `#/c/${info.chId}`; done(); }}><${Icon} d=${I.person} /><span>チャンネルに移動</span></button>`}
       ${(inFeed || v.rec) && html`<button class="sheet-i" onClick=${() => { hideVideo(v.id); toast('この動画は今後表示されません'); done(); }}><${Icon} d=${I.hide} /><span>興味なし</span></button>`}
@@ -335,11 +351,17 @@ export function Home() {
     return ['all', 'new', 'music', 'continue'].includes(c) ? c : 'all';
   });
   useEffect(() => {
-    const f = () => { setChip('all'); scrollTo({ top: 0 }); };
+    const f = () => {
+      clearRankCache(); // 押し直したら、並びも新しく
+      setGen((g) => g + 1);
+      setChip('all');
+      scrollTo({ top: 0 });
+    };
     addEventListener('tz:home-reset', f);
     return () => removeEventListener('tz:home-reset', f);
   }, []);
-  const basis = useRankBasis(chip);
+  const [gen, setGen] = useState(0);
+  const basis = useRankBasis(chip + ':' + gen);
   const aff = useAffinity(basis);
   const disc = useDiscover(basis, aff);
   useEffect(() => { try { sessionStorage.setItem('tz:chip', chip); } catch (_) {} }, [chip]);
@@ -376,7 +398,7 @@ export function Home() {
     </${Empty}>`;
   }
   return html`<div class="page">
-    <${Chips} value=${chip} onChange=${setChip} items=${[['all', 'すべて'], ['new', '新着'], ['music', '音楽'], ['continue', '続きから']]} />
+    <${Chips} value=${chip} onChange=${(c) => { if (c !== chip) dropRankCache(c + ':' + gen); setChip(c); }} items=${[['all', 'すべて'], ['new', '新着'], ['music', '音楽'], ['continue', '続きから']]} />
     ${chip === 'music' && html`<${MusicView} feed=${long} />`}
     ${chip === 'all' && html`
       ${morning.length > 0 && html`<${MorningBox} items=${morning} left=${morningLeft} end=${end} />`}
@@ -384,7 +406,7 @@ export function Home() {
     `}
     ${chip === 'music' ? null : list.length === 0
       ? html`<${Empty}>${chip === 'continue' ? '途中まで見た動画はありません' : '動画がありません'}</${Empty}>`
-      : html`<div class="grid"><${Paged} items=${items} resetKey=${chip} render=${(v) =>
+      : html`<div class="grid"><${Paged} items=${items} resetKey=${chip} memKey="home" render=${(v) =>
           v.kind === 'shorts' ? html`<div class="grid-full" key="__shorts"><${ShortsShelf} items=${shorts} /></div>` : html`<${VideoCard} key=${v.id} v=${v} queue=${ids} />`} /></div>`}
   </div>`;
 }
@@ -712,9 +734,12 @@ function ChannelRow({ c }) {
 
 // ------------------------------------------------------------------ チャンネルのページ
 const chCache = new Map();
+const tabMem = new Map(); // チャンネルごとに、最後に開いたタブ(動画から戻ったとき同じ一覧に)
 export function ChannelPage({ id }) {
   const local = chById(id);
-  const [tab, setTab] = useState('videos');
+  const [tab, setTab0] = useState(() => tabMem.get(id) || 'videos');
+  const setTab = (t) => { tabMem.set(id, t); setTab0(t); };
+  const [moreErr, setMoreErr] = useState(false);
   const key = id + ':' + tab;
   const [data, setData] = useState(() => chCache.get(key) || null);
   const [err, setErr] = useState('');
@@ -758,13 +783,18 @@ export function ChannelPage({ id }) {
         cont: d.cont,
       };
       chCache.set(myKey, nd);
-      if (keyRef.current === myKey) setData(nd); // 途中でタブを替えていたら、今の画面には入れない
+      if (keyRef.current === myKey) {
+        setData(nd); // 途中でタブを替えていたら、今の画面には入れない
+        setMoreErr(false);
+      }
     } catch (e) {
+      if (keyRef.current === myKey) setMoreErr(true);
       toast(e.message);
     } finally {
       setMore(false);
     }
   };
+  useEffect(() => setMoreErr(false), [key]);
   useEffect(() => {
     if (ch.title) setState({ routeTitle: ch.title });
   }, [ch.title]);
@@ -790,19 +820,29 @@ export function ChannelPage({ id }) {
     ${tab === 'shorts'
       ? html`<div class="sgrid three">${shorts.map((v) => html`<${ShortCard} key=${v.id} v=${v} list=${shorts} wide />`)}</div>`
       : html`<div class="grid">${vids.map((v) => html`<${VideoCard} key=${v.id} v=${v} queue=${ids} />`)}</div>`}
-    ${data?.cont && html`<div class="center"><button class="btn ghost" disabled=${more} onClick=${loadMore}>${more ? '読み込み中…' : 'もっと見る'}</button></div>`}
+    ${data?.cont && (moreErr
+      ? html`<div class="center"><button class="btn ghost" onClick=${() => { setMoreErr(false); loadMore(); }}>もう一度読み込む</button></div>`
+      : more ? html`<div class="loading"><span class="spinner"></span></div>` : html`<${Sentinel} onSee=${loadMore} k=${(data.videos || []).length + (data.shorts || []).length} />`)}
   </div>`;
 }
 
 // ------------------------------------------------------------------ 検索
 const SEARCHES = 'tsuzuki:searches';
 const searchCache = new Map();
+const spMem = new Map(); // 検索語ごとに、選んだ絞り込み
+// 検索の絞り込み(YouTube の検索フィルタ。サーバー側で決まったものだけ通す)
+const SEARCH_FILTERS = [['', 'すべて'], ['EgIQAQ==', '動画'], ['CAISAhAB', '新しい順'], ['CAMSAhAB', '視聴回数順'], ['EgQIAxAB', '今週'], ['EgQIBBAB', '今月'], ['EgQQARgB', '4分未満'], ['EgQQARgC', '20分以上']];
 const sugCache = new Map();
 export function Search({ q: q0 }) {
   const [q, setQ] = useState(q0 || '');
   const [typing, setTyping] = useState(!q0);
   const [sug, setSug] = useState([]);
-  const [data, setData] = useState(() => (q0 ? searchCache.get(q0) : null) || null);
+  const [sp, setSp0] = useState(() => spMem.get(q0) || '');
+  const setSp = (v) => { spMem.set(q0, v); setSp0(v); };
+  const ck = q0 + '|' + sp;
+  const ckRef = useRef(ck);
+  ckRef.current = ck;
+  const [data, setData] = useState(() => (q0 ? searchCache.get(q0 + '|' + (spMem.get(q0) || '')) : null) || null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   const [hist, setHist] = useState(() => lsGetJson(SEARCHES, []));
@@ -817,7 +857,7 @@ export function Search({ q: q0 }) {
       setTimeout(() => inputRef.current?.focus(), 50);
       return;
     }
-    const c = searchCache.get(q0);
+    const c = searchCache.get(ck);
     if (c) {
       setData(c);
       return;
@@ -825,12 +865,12 @@ export function Search({ q: q0 }) {
     let off = false;
     setData(null);
     setBusy(true);
-    fn('search', { q: q0 })
+    fn('search', { q: q0, sp })
       .then((d) => {
         if (off) return;
         rememberHits(d.videos);
         rememberHits(shortHits(d.shorts));
-        searchCache.set(q0, d);
+        searchCache.set(ck, d);
         setData(d);
       })
       .catch((e) => !off && setErr(e.message))
@@ -838,7 +878,7 @@ export function Search({ q: q0 }) {
     return () => {
       off = true;
     };
-  }, [q0]);
+  }, [q0, sp]);
   // 打っている途中の候補(YouTube と同じ候補)
   useEffect(() => {
     const s = q.trim();
@@ -882,20 +922,27 @@ export function Search({ q: q0 }) {
     e.preventDefault();
     go(q);
   };
+  const [moreErr, setMoreErr] = useState(false);
+  useEffect(() => setMoreErr(false), [ck]);
   const more = async () => {
-    if (!data?.cont) return;
+    if (!data?.cont || busy) return;
+    const myKey = ck;
     setBusy(true);
     try {
       const d = await fn('search', { q: q0, cont: data.cont });
       rememberHits(d.videos);
       rememberHits(shortHits(d.shorts));
       const nd = { ...data, videos: [...data.videos, ...d.videos.filter((v) => !data.videos.some((x) => x.id === v.id))], cont: d.cont };
-      searchCache.set(q0, nd);
-      setData(nd);
+      searchCache.set(myKey, nd);
+      if (ckRef.current === myKey) {
+        setData(nd);
+        setMoreErr(false);
+      }
     } catch (e) {
+      if (ckRef.current === myKey) setMoreErr(true);
       toast(e.message);
     } finally {
-      setBusy(false);
+      if (ckRef.current === myKey) setBusy(false);
     }
   };
   const vids = (data?.videos || []).map(fromHit);
@@ -928,19 +975,110 @@ export function Search({ q: q0 }) {
         </div>`
       : html`
         ${err && html`<p class="err pad">${err}</p>`}
+        <${Chips} value=${sp} onChange=${setSp} items=${SEARCH_FILTERS} />
         ${busy && !data && html`<div class="loading"><span class="spinner"></span></div>`}
         ${data && html`
           ${(data.channels || []).map((c) => html`<div class="pad-x" key=${c.id}><${ChannelRow} c=${c} /></div>`)}
           <div class="grid">${items.map((v) =>
             v.kind === 'shorts' ? html`<div class="grid-full" key="__shorts"><${ShortsShelf} items=${shorts} /></div>` : html`<${VideoCard} key=${v.id} v=${v} queue=${ids} />`)}</div>
           ${vids.length === 0 && !(data.channels || []).length && !shorts.length && html`<${Empty}>見つかりませんでした</${Empty}>`}
-          ${data.cont && html`<div class="center"><button class="btn ghost" disabled=${busy} onClick=${more}>${busy ? '読み込み中…' : 'もっと見る'}</button></div>`}
+          ${data.cont && (moreErr
+            ? html`<div class="center"><button class="btn ghost" onClick=${more}>もう一度読み込む</button></div>`
+            : busy ? html`<div class="loading"><span class="spinner"></span></div>` : html`<${Sentinel} onSee=${more} k=${vids.length} />`)}
         `}
       `}
   </div>`;
 }
 
 // ------------------------------------------------------------------ 再生画面
+// 再生キュー: 次に流す順番を見て、入れ替え・外す・シャッフル・リピート
+// 再生画面の「次の動画」の帯(押すとキュー)
+function UpNextStrip({ id, onOpen }) {
+  const q = P.usePlayer((p) => p.queue) || [];
+  useStore((s) => s.progress);
+  const repeat = useStore((s) => s.prefs.repeat || 'off');
+  const autoNext = useStore((s) => s.prefs.autoNext);
+  const n = P.nextInfo();
+  if (!n.id) return null;
+  const v = videoInfo(n.id);
+  const cur = q.indexOf(id);
+  const pos = q.indexOf(n.id);
+  let label;
+  if (n.from !== 'user' && !autoNext) label = '次の候補(自動再生はオフ)';
+  else if (n.from === 'related') label = '自動再生: 関連動画から';
+  else if (cur >= 0 && pos >= 0) {
+    const step = repeat === 'all' ? (pos - cur + q.length) % q.length : pos - cur;
+    const total = repeat === 'all' ? q.length - 1 : q.length - cur - 1;
+    label = `キュー ${step} / ${Math.max(1, total)}${repeat === 'all' ? '(くり返し)' : ''}`;
+  } else label = 'キュー';
+  return html`<button class="w-upnext" onClick=${onOpen}>
+    <img src=${thumb(n.id, 'mqdefault')} alt="" />
+    <div class="w-upnext-b"><span class="w-upnext-l">次 ・ ${label}</span><span class="w-upnext-t">${v.title || '次の動画'}</span></div>
+    <${Icon} d=${P.IC.queue} size=${22} />
+  </button>`;
+}
+
+function QueuePanel({ id }) {
+  const q = P.usePlayer((p) => p.queue) || [];
+  const repeat = useStore((s) => s.prefs.repeat || 'off');
+  const autoNext = useStore((s) => s.prefs.autoNext);
+  const progress = useStore((s) => s.progress);
+  useStore((s) => s.videos); // 題名の描き直し
+  const [drag, setDrag] = useState(null); // { id, i, y0, dy, h }
+  const [undo, setUndo] = useState(null); // { snap, title, k }
+  useEffect(() => {
+    if (!undo) return;
+    const t = setTimeout(() => setUndo((u) => (u === undo ? null : u)), 5000);
+    return () => clearTimeout(t);
+  }, [undo]);
+  const remove = (vid) => {
+    const snap = P.queueSnapshot();
+    P.queueRemove(vid);
+    setUndo({ snap, title: videoInfo(vid).title || '動画', k: Date.now() });
+  };
+  const cur = q.indexOf(id);
+  const list = cur >= 0 ? q.slice(cur) : [id, ...q];
+  const shown = list.slice(0, 80);
+  const nextRepeat = { off: 'all', all: 'one', one: 'off' }[repeat] || 'all';
+  return html`<div class="qp">
+    <div class="qp-bar">
+      <button class=${clsx('chip', repeat !== 'off' && 'on')} onClick=${() => setPref('repeat', nextRepeat)}><${Icon} d=${repeat === 'one' ? P.IC.repeatOne : P.IC.repeat} size=${18} />${{ off: 'リピートなし', all: 'キュー全体をくり返す', one: 'この動画をくり返す' }[repeat]}</button>
+      <button class="chip" onClick=${() => { P.queueShuffle(); toast('次からの順番をまぜました'); }}><${Icon} d=${P.IC.shuffle} size=${18} />シャッフル</button>
+      ${list.length > 1 && html`<button class="chip" onClick=${() => { if (confirm('キューを空にしますか?(いま流している動画はそのまま)')) P.queueClear(); }}><${Icon} d=${P.IC.close} size=${18} />空にする</button>`}
+    </div>
+    ${undo && html`<div class="qp-undo"><span>「${undo.title}」を外しました</span><button class="link" onClick=${() => { P.queueRestore(undo.snap.q, undo.snap.user); setUndo(null); }}>元に戻す</button></div>`}
+    ${shown.map((vid, i) => {
+      const v = videoInfo(vid);
+      const now = i === 0;
+      const skip = !now && repeat !== 'all' && !P.isUserQueued(vid) && progress[vid]?.done;
+      const dragging = drag && drag.id === vid;
+      return html`<div key=${vid} class=${clsx('qp-row', now && 'now', skip && 'skip', dragging && 'dragging')} style=${dragging ? { transform: `translateY(${drag.dy}px)` } : null}>
+        <div class="qp-th" onClick=${() => !now && (location.hash = `#/w/${vid}`)}>
+          <img src=${thumb(vid, 'mqdefault')} alt="" loading="lazy" />
+          ${now && html`<span class="qp-now">再生中</span>`}
+        </div>
+        <div class="qp-body" onClick=${() => !now && (location.hash = `#/w/${vid}`)}>
+          <div class="qp-title">${v.title || '(題名を読み込み中)'}</div>
+          <div class="qp-sub">${[v.cht, skip ? '見終わり・飛ばします' : P.isUserQueued(vid) && !now ? '自分で追加' : ''].filter(Boolean).join(' ・ ')}</div>
+        </div>
+        ${!now && html`<div class="qp-ops">
+          <button class="ib sm" aria-label="外す" onClick=${() => remove(vid)}><${Icon} d=${P.IC.close} size=${18} /></button>
+          <span class="qp-grip" aria-label="つまんで並べ替え"
+            onPointerDown=${(e) => { e.preventDefault(); try { e.currentTarget.setPointerCapture(e.pointerId); } catch (_) {} const h = e.currentTarget.closest('.qp-row').offsetHeight || 64; setDrag({ id: vid, i, y0: e.clientY, dy: 0, h }); }}
+            onPointerMove=${(e) => setDrag((d) => (d && d.id === vid ? { ...d, dy: e.clientY - d.y0 } : d))}
+            onPointerUp=${() => setDrag((d) => { if (d && d.id === vid) { const to = Math.min(list.length - 1, Math.max(1, d.i + Math.round(d.dy / d.h))); if (to !== d.i) P.queueMoveTo(vid, to); } return null; })}
+            onPointerCancel=${() => setDrag(null)}><${Icon} d=${P.IC.drag} size=${22} /></span>
+        </div>`}
+      </div>`;
+    })}
+    ${list.length > shown.length && html`<p class="note">ほか ${list.length - shown.length} 本</p>`}
+    <p class="note qp-foot">${list.length <= 1
+      ? '動画の「⋮」→「次に再生」「キューに追加」で、ここに並べられます。'
+      : repeat === 'all' ? 'キューの最後まで来たら、先頭からくり返します。'
+      : autoNext ? 'キューの最後まで来たら、関連動画から自動で続けます。' : '自動再生がオフなので、キューの最後で止まります。'}</p>
+  </div>`;
+}
+
 function readSleep(id) {
   const s = lsGetJson('tsuzuki:sleep', null);
   if (!s || Date.now() - s.at > 18 * 3600e3 || (s.id !== id && s.touchId !== id)) return null;
@@ -1013,13 +1151,16 @@ function Comment({ c }) {
   </div>`;
 }
 
-function Sentinel({ onSee }) {
+// 一覧の下に置く見えない目印。見えたら続きを読む(k が変わったら見張り直す。描き直しのたびに二重に読まないように)
+function Sentinel({ onSee, k = 0 }) {
   const ref = useRef(null);
+  const cb = useRef(onSee);
+  cb.current = onSee;
   useEffect(() => {
-    const io = new IntersectionObserver((es) => es.some((e) => e.isIntersecting) && onSee(), { rootMargin: '400px' });
+    const io = new IntersectionObserver((es) => es.some((e) => e.isIntersecting) && cb.current(), { rootMargin: '400px' });
     if (ref.current) io.observe(ref.current);
     return () => io.disconnect();
-  }, [onSee]);
+  }, [k]);
   return html`<div ref=${ref} class="more-sentinel"></div>`;
 }
 
@@ -1096,6 +1237,8 @@ export function Watch({ id }) {
   const when = detail?.ptxt || info.ptxt || (info.pub ? ago(info.pub) : '');
   const title = info.title || detail?.title || '読み込み中…';
   const first = com.items[0];
+  const pq = P.usePlayer((p) => p.queue);
+  const upcoming = Math.max(0, (pq || []).length - (pq || []).indexOf(id) - 1);
   return html`<div class="watch">
     <div class="w-spacer"></div>
     <div class="w-main">
@@ -1116,9 +1259,11 @@ export function Watch({ id }) {
         <div class="w-actions">
           <button class=${clsx('pill', later && 'on')} onClick=${() => toggleLater(info)}><${Icon} d=${later ? I.saved : I.save} size=${20} />${later ? '保存済み' : '保存'}</button>
           <button class="pill" onClick=${share}><${Icon} d=${I.share} size=${20} />共有</button>
+          <button class="pill" onClick=${() => setPanel('queue')}><${Icon} d=${P.IC.queue} size=${20} />キュー${upcoming > 0 ? ` ${upcoming}` : ''}</button>
           <button class="pill" onClick=${() => P.restart()}><${Icon} d=${I.restart} size=${20} />最初から</button>
           <a class="pill" href=${watchUrl(id, P.getPs().time)} target="_blank" rel="noopener"><${Icon} d=${I.open} size=${20} />YouTube で開く</a>
         </div>
+        <${UpNextStrip} id=${id} onOpen=${() => setPanel('queue')} />
         ${(com.count || first) && html`<div class="w-com" onClick=${() => setPanel('comments')}>
           <div class="w-com-h"><b>コメント</b><span>${com.count}</span></div>
           ${first ? html`<div class="w-com-1"><${Avatar} src=${first.avatar} title=${first.author} size=${24} /><span>${first.text}</span></div>`
@@ -1147,12 +1292,15 @@ export function Watch({ id }) {
         <div><div class="w-ch-t">${ch.title}</div><div class="w-ch-s">${detail?.channel?.subs || ''}</div></div>
       </a>
     </${Panel}>`}
+    ${panel === 'queue' && html`<${Panel} title="キュー" sub=${upcoming ? `あと ${upcoming} 本` : ''} onClose=${() => setPanel(null)}>
+      <${QueuePanel} id=${id} />
+    </${Panel}>`}
     ${panel === 'comments' && html`<${Panel} title="コメント" sub=${com.count} onClose=${() => setPanel(null)}>
       <p class="note">コメントは読むだけです(書きこみは YouTube で)。</p>
       ${com.items.map((c) => html`<${Comment} key=${c.id} c=${c} />`)}
       ${com.busy && html`<div class="loading"><span class="spinner"></span></div>`}
       ${com.err && html`<p class="err">${com.err}</p>`}
-      ${com.cont && !com.busy && html`<${Sentinel} onSee=${com.loadMore} />`}
+      ${com.cont && !com.busy && html`<${Sentinel} onSee=${com.loadMore} k=${com.items.length} />`}
     </${Panel}>`}
   </div>`;
 }
@@ -1299,6 +1447,15 @@ function HowTo() {
   useEffect(() => {
     try { navigator.brave?.isBrave?.().then((b) => setBrave(!!b)).catch(() => {}); } catch (_) { /* 何もしない */ }
   }, []);
+  const copyChrome = async () => {
+    const url = 'googlechromes://' + location.host + location.pathname;
+    try {
+      await navigator.clipboard.writeText(url);
+      toast('コピーしました。ショートカットの「URL を開く」に貼ってください');
+    } catch (_) {
+      prompt('このリンクをコピーしてください', url);
+    }
+  };
   const copyBrave = async () => {
     const url = 'brave://open-url?url=' + encodeURIComponent(location.origin + location.pathname);
     try {
@@ -1324,6 +1481,10 @@ function HowTo() {
         <span>4. 下の名前の横の ⌄(または共有ボタン)→「ホーム画面に追加」。名前は「つづきから(音)」など、アイコンは好きな写真に</span>
         <span>このアイコンから開くと Brave で開くので、Brave のバックグラウンド再生が効きます。全画面は Chrome のアイコン、画面を消して聴くときは Brave のアイコン、と使い分けられます。</span>
         <button class="btn sm" onClick=${copyBrave}>Brave で開くリンクをコピー</button></div>
+      <div class="li col"><b>Chrome で開くアイコンにする</b>
+        <span>いちばんのおすすめは、Chrome でこのページを開き、共有ボタン(□↑)→「ホーム画面に追加」で作ったアイコンです。上のバーのない全画面で開きます。</span>
+        <span>ショートカットで作ったアイコン(Brave で開くもの)を Chrome に変えたいときは、ショートカットの「URL を開く」に、下のボタンでコピーしたリンクを貼り替えてください。</span>
+        <button class="btn sm" onClick=${copyChrome}>Chrome で開くリンクをコピー</button></div>
     </div>`;
 }
 

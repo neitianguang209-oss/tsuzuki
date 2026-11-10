@@ -1,8 +1,9 @@
 // 動画プレーヤー: YouTube 公式の埋め込み(iframe API)を1つだけ作り、画面を移っても使い回す(小さい再生窓になる)。
 // 広告や動画そのものには手を加えない。こちらが行うのは、操作ボタン・続きからの再開・字幕を出さない設定だけ。
 import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { html, fmtTime, watchUrl, clsx, leaveWatch, lsSetJson, setThemeBlack } from './util.js';
-import { getState as appState, subscribe as subscribeApp, setProgress, flushProgress, videoInfo, videoDetail, toast, setPref, whenLoaded } from './store.js';
+import { html, fmtTime, watchUrl, clsx, leaveWatch, lsSetJson, lsGetJson, setThemeBlack, parseChapters } from './util.js';
+import { fn } from './api.js';
+import { getState as appState, subscribe as subscribeApp, setProgress, flushProgress, videoInfo, videoDetail, toast, setPref, whenLoaded, rememberDetail, rememberHits } from './store.js';
 
 // ------------------------------------------------------------------ プレーヤーの状態(アプリの状態とは別。0.5秒ごとに変わるため)
 let ps = {
@@ -31,6 +32,11 @@ let ps = {
   sleepWarn: false, // まもなく止まる(1分前)
   rotRev: (() => { try { return localStorage.getItem('tsuzuki:rotDir') === '-90'; } catch (_) { return false; } })(), // 回す向きを反対に
   loadedAt: 0, // この動画を読み込んだ時刻(広告スキップの案内を出す間)
+  loadedStart: 0, // この動画を流し始めた位置
+  adUsed: false, // (使っていない)
+  contentStarted: false, // 本編が流れ始めた(広告が終わった)。「広告をスキップ」を消す合図
+  adOver: false, // 読み込みから60秒たった(「広告をスキップ」を出さない)
+  chapIdx: -1, // いまのチャプター(曲目)の番号
 };
 
 // iPhone・iPad か / ホーム画面のアイコンから開いているか
@@ -56,6 +62,9 @@ const pEmit = () => pl.forEach((l) => l());
 function setPs(patch) {
   ps = { ...ps, ...patch };
   pEmit();
+  if ('queue' in patch || 'id' in patch) {
+    try { saveQueue(); } catch (_) { /* 起動直後 */ }
+  }
 }
 export const getPs = () => ps;
 export function usePlayer(sel) {
@@ -256,8 +265,16 @@ function onState(st) {
       if (ps.fs) exitFs();
       return;
     }
-    // 小さい窓で流しているときは、勝手に再生画面へ移らない
-    if (ps.mode === 'full' || ps.fs) scheduleNext();
+    // 1本リピート: 頭に戻ってもう一度
+    if (appState().prefs.repeat === 'one') {
+      try {
+        player.seekTo(0, true);
+        player.playVideo();
+      } catch (_) { /* 何もしない */ }
+      return;
+    }
+    // 小さい窓でも、次の動画へ進む(小さい窓のまま)
+    if (ps.mode === 'full' || ps.fs || ps.mode === 'mini') scheduleNext();
   }
 }
 
@@ -269,8 +286,27 @@ const ERR = {
   150: '投稿者がほかのサイトでの再生を許可していない動画です',
   153: 'この動画はここでは再生できません',
 };
+// ここ(埋め込み)では流せない動画は覚えておき、次からは「次の動画」の候補に入れない
+const NOEMB = 'tsuzuki:noembed';
+const noEmbed = new Set(lsGetJson(NOEMB, []) || []);
+let err5Id = ''; // エラー5は一時的なこともあるので、同じ動画で2回続いたときだけ覚える
 function onError(code) {
+  const bad = [5, 101, 150, 153].includes(code);
+  if (bad && ps.id && (code !== 5 || err5Id === ps.id)) {
+    noEmbed.add(ps.id);
+    lsSetJson(NOEMB, [...noEmbed].slice(-300));
+  }
+  if (code === 5) err5Id = ps.id;
   setPs({ error: ERR[code] || `再生できませんでした(${code})`, pass: false });
+  // 自動で次へ進んできた動画なら、止めずにその次へ(自分で開いた動画では勝手に進まない)
+  if (bad && ps.mode !== 'short' && autoCame) {
+    const n = nextInfo();
+    if (n.id && (n.from === 'user' || appState().prefs.autoNext)) {
+      setPs({ upNext: { id: n.id, ms: 2500 } });
+      clearTimeout(nextTimer);
+      nextTimer = setTimeout(() => { if (ps.upNext?.id === n.id) playNext(); }, 2500);
+    }
+  }
 }
 
 // ------------------------------------------------------------------ 再生位置の記録
@@ -308,7 +344,38 @@ setInterval(() => {
   } catch (_) { /* まだ準備中 */ }
   if (Math.abs(t - ps.time) > 0.2 || d !== ps.dur) setPs({ time: t, dur: d });
   if (ps.st === 1 && Date.now() - lastSaved > 5000) saveNow(false);
+  // 本編が流れ始めたら(広告のあいだは本編の位置が進まない)、「広告をスキップ」を消し、直接さわる状態も戻す
+  if (!ps.contentStarted && ps.st === 1 && t > (ps.loadedStart || 0) + 2 && curVid() === ps.id) {
+    setPs({ contentStarted: true });
+    if (noEmbed.delete(ps.id)) lsSetJson(NOEMB, [...noEmbed]); // 流せたので「流せない動画」から外す
+    if (adPassActive && ps.pass) {
+      adPassActive = false;
+      setPass(false);
+    }
+  }
+  // チャプター(曲目)が変わったら、ロック画面の曲名も替える
+  const ch = chaptersOf(ps.id);
+  if (ch.length) {
+    let k = 0;
+    while (k + 1 < ch.length && ch[k + 1].sec <= t + 0.5) k++;
+    if (k !== ps.chapIdx) {
+      setPs({ chapIdx: k });
+      mediaMeta();
+    }
+  } else if (ps.chapIdx !== -1) setPs({ chapIdx: -1 });
 }, 500);
+
+// チャプター(曲目)。説明欄から作り、動画ごとに覚えておく
+const chapCache = new Map();
+export function chaptersOf(id) {
+  if (!id) return [];
+  if (chapCache.has(id)) return chapCache.get(id);
+  const d = videoDetail(id);
+  if (!d) return [];
+  const c = parseChapters(d.desc || '');
+  chapCache.set(id, c);
+  return c;
+}
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') saveNow(true);
@@ -316,29 +383,62 @@ document.addEventListener('visibilitychange', () => {
 addEventListener('pagehide', () => saveNow(true));
 
 // ------------------------------------------------------------------ 操作
-export async function load(id, { queue, short = false } = {}) {
+export async function load(id, { queue, short = false, keepMini = false } = {}) {
   if (!id) return;
-  const mode = short ? 'short' : 'full';
-  if (queue) setPs({ queue });
+  const mode = short ? 'short' : keepMini && ps.mode === 'mini' ? 'mini' : 'full';
+  if (!short) {
+    // 自分で「次に再生」「キューに追加」した動画は、一覧から開き直しても新しい動画のすぐ後ろに残す
+    const old = ps.queue || [];
+    const anchor = ps.id || restoredId; // アプリを開き直した直後は、前回流していた動画を目印にする
+    const oi = anchor ? old.indexOf(anchor) : -1;
+    const pend = oi >= 0 ? old.slice(oi + 1).filter((x) => userQueued.has(x) && x !== id) : [];
+    restoredId = '';
+    if (queue) {
+      // 一覧から来た続きのうち、もう見終わった動画は入れない(キューの表示と実際に流れる順番をそろえる)
+      const prog = appState().progress;
+      const nq = queue.filter((x) => !pend.includes(x) && (x === id || userQueued.has(x) || !prog[x]?.done));
+      let at = nq.indexOf(id);
+      if (at < 0) {
+        nq.unshift(id);
+        at = 0;
+      }
+      if (pend.length) nq.splice(at + 1, 0, ...pend);
+      setPs({ queue: nq });
+      for (const x of [...userQueued]) if (!nq.includes(x)) userQueued.delete(x); // 使われなかった印は消す
+    } else if (!(ps.queue || []).includes(id)) {
+      // 並びの外の動画を開いた: その動画から始め直す(自分で入れた分は残す)
+      for (const x of [...userQueued]) if (!pend.includes(x)) userQueued.delete(x);
+      setPs({ queue: [id, ...pend] });
+    }
+  }
   ensureAlive();
   if (ps.id === id && (player || creating || want)) {
     if (ps.mode !== mode) setPs({ mode });
     return;
   }
+  userQueued.delete(id); // 流し始めたら「自分で追加」の印は外す(2回目は、見終わりなら飛ばす)
+  autoCame = autoNextPending === id;
+  autoNextPending = '';
+  clearTimeout(adTimer);
+  adPassActive = false;
+  clearTimeout(passTimer);
   if (ps.id) saveNow(true);
   clearNext();
   captionsOffFor = '';
   if (ps.fs && short) exitFs();
-  setPs({ id, mode, st: -1, time: 0, dur: short ? 0 : videoInfo(id).dur || 0, error: '', live: false, upNext: null, autoPass: false, userPaused: false, loadedAt: Date.now() });
+  setPs({ id, mode, st: -1, time: 0, dur: short ? 0 : videoInfo(id).dur || 0, error: '', live: false, upNext: null, autoPass: false, userPaused: false, loadedAt: Date.now(), loadedStart: 0, contentStarted: false, adOver: false, chapIdx: -1 });
+  adTimer = setTimeout(() => { if (ps.id === id) setPs({ adOver: true }); }, 60e3);
   if (pendingSeek && pendingSeek.id !== id) pendingSeek = null;
-  if (!ps.manualPass && ps.started && ps.pass) setPs({ pass: false }); // 前の動画で「直接タップ」にしていたら戻す
+  // 前の動画で「直接さわる」にしていたら戻す(最初の1本の「▶ を直接押す」状態はそのまま)
+  if (ps.started && ps.pass) setPs({ pass: false, manualPass: false });
+  else if (ps.manualPass) setPs({ manualPass: false });
   mediaMeta();
   // 別の端末で見た位置が届く前に始めると、古い位置から流して上書きしてしまうので、アプリを開いた直後の読み込みだけは少し待つ
   // (2本目からは待たない。待つと、押しても切りかわらないように見える)
   if (!short && (!appState().booted || appState().resyncing)) await whenLoaded(3500);
   if (ps.id !== id) return; // 待っている間に別の動画が選ばれた
   const start = short ? 0 : resumePoint(id);
-  setPs({ time: start });
+  setPs({ time: start, loadedStart: start });
   if (!player || !ps.ready) {
     want = { id, start };
     if (!player) create();
@@ -401,7 +501,8 @@ export function seekTo(sec) {
   if (ps.upNext) clearNext();
   try {
     player.seekTo(t, true);
-    setPs({ time: t });
+    // 本編が始まる前に飛んだときは、飛んだ先を「流し始めた位置」にする(広告スキップのボタンを正しく消すため)
+    setPs(ps.contentStarted ? { time: t } : { time: t, loadedStart: t });
     if (ps.st !== 1) player.playVideo();
   } catch (_) { /* 準備中 */ }
   lastSaved = 0;
@@ -424,12 +525,18 @@ export function playPrev() {
   const i = q.indexOf(ps.id);
   if ((ps.time || 0) > 5 || i <= 0) return seekTo(0);
   clearNext();
-  location.hash = `#/w/${q[i - 1]}`;
+  if (ps.mode === 'mini' && !ps.fs) {
+    load(q[i - 1], { keepMini: true });
+    ensureDetail(q[i - 1]);
+  } else location.hash = `#/w/${q[i - 1]}`;
 }
 let passTimer = 0;
+let adPassActive = false; // 「広告をスキップ」で直接さわる状態にしている
+let adTimer = 0;
 // autoMs: その時間がたったら操作ボタンに自動で戻す(広告のスキップ用)
-export function setPass(on, autoMs = 0) {
+export function setPass(on, autoMs = 0, forAd = false) {
   clearTimeout(passTimer);
+  adPassActive = !!(on && forAd);
   setPs({ pass: on, manualPass: on });
   if (on && autoMs) {
     passTimer = setTimeout(() => {
@@ -608,9 +715,11 @@ export function mediaMeta() {
     let vd = null;
     try { vd = player?.getVideoData?.(); } catch (_) { /* 準備中 */ }
     const ok = vd && vd.video_id === ps.id;
+    const vt = info.title || (ok && vd.title) || 'つづきから';
+    const chap = chaptersOf(ps.id)[ps.chapIdx];
     ms.metadata = new MediaMetadata({
-      title: info.title || (ok && vd.title) || 'つづきから',
-      artist: info.cht || (ok && vd.author) || '',
+      title: chap ? chap.title : vt,
+      artist: chap ? vt : info.cht || (ok && vd.author) || '',
       album: 'つづきから',
       artwork: [
         { src: `https://i.ytimg.com/vi/${ps.id}/mqdefault.jpg`, sizes: '320x180', type: 'image/jpeg' },
@@ -634,11 +743,140 @@ function mediaState() {
   };
   h('play', () => { sleepHoldUntil = 0; setPs({ userPaused: false }); try { player?.playVideo(); } catch (_) {} });
   h('pause', () => { setPs({ userPaused: true }); try { player?.pauseVideo(); } catch (_) {} });
-  h('previoustrack', () => { if (ps.mode !== 'short') playPrev(); });
-  h('nexttrack', () => { if (ps.mode !== 'short' && nextCandidate()) playNext(); });
+  // チャプター(曲目)のある動画では、前/次はチャプターを移る
+  h('previoustrack', () => {
+    if (ps.mode === 'short') return;
+    const ch = chaptersOf(ps.id);
+    if (ch.length && ps.chapIdx >= 0) {
+      const c = ch[ps.chapIdx];
+      if (ps.chapIdx === 0 && (ps.time || 0) - c.sec <= 3) return playPrev(); // 最初の曲の頭なら、前の動画へ
+      return seekTo((ps.time || 0) - c.sec > 3 || ps.chapIdx === 0 ? c.sec : ch[ps.chapIdx - 1].sec);
+    }
+    playPrev();
+  });
+  h('nexttrack', () => {
+    if (ps.mode === 'short') return;
+    const ch = chaptersOf(ps.id);
+    if (ch.length && ps.chapIdx + 1 < ch.length) return seekTo(ch[ps.chapIdx + 1].sec);
+    if (nextCandidate()) playNext();
+  });
   h('seekbackward', () => seekBy(-10));
   h('seekforward', () => seekBy(10));
 })();
+
+// ------------------------------------------------------------------ 再生キュー(次に流す順番)
+const userQueued = new Set(); // 自分で「次に再生」「キューに追加」した動画
+// キューは端末に保存(アプリが閉じられても戻る。12時間まで)
+const QKEY = 'tsuzuki:queue';
+function saveQueue() {
+  try {
+    lsSetJson(QKEY, { id: ps.id, queue: (ps.queue || []).slice(0, 200), user: [...userQueued], at: Date.now() });
+  } catch (_) { /* 何もしない */ }
+}
+let restoredId = ''; // 起動時に戻したキューで、前回流していた動画
+(() => {
+  const s = lsGetJson(QKEY, null);
+  if (s && Array.isArray(s.queue) && Date.now() - (s.at || 0) < 12 * 3600e3) {
+    ps = { ...ps, queue: s.queue };
+    restoredId = s.id || '';
+    for (const u of s.user || []) userQueued.add(u);
+  }
+})();
+// 次の動画への待ちの最中に並びを変えたら、待っている動画を決め直す
+function refreshNext() {
+  saveQueue();
+  if (!ps.upNext) return;
+  const id = nextCandidate();
+  if (!id) clearNext();
+  else if (id !== ps.upNext.id) scheduleNext();
+}
+function baseQueue() {
+  const q = (ps.queue || []).slice();
+  if (ps.id && q.indexOf(ps.id) < 0) q.unshift(ps.id);
+  return q;
+}
+// 戻り値: 'play'(何も流れていないので、すぐ流した) / 'same' / 'next' / 'add'
+export function queueNext(id) {
+  if (!ps.id || ps.mode === 'short') {
+    location.hash = `#/w/${id}`;
+    return 'play';
+  }
+  if (id === ps.id) return 'same';
+  const q = baseQueue().filter((x) => x !== id);
+  q.splice(q.indexOf(ps.id) + 1, 0, id);
+  userQueued.add(id);
+  setPs({ queue: q });
+  refreshNext();
+  return 'next';
+}
+export function queueAdd(id) {
+  if (!ps.id || ps.mode === 'short') {
+    location.hash = `#/w/${id}`;
+    return 'play';
+  }
+  if (id === ps.id) return 'same';
+  const q = baseQueue().filter((x) => x !== id);
+  // 自分で入れた動画の並びの最後(一覧から来た続きより前)に入れる
+  let at = q.indexOf(ps.id) + 1;
+  while (at < q.length && userQueued.has(q[at])) at++;
+  q.splice(at, 0, id);
+  userQueued.add(id);
+  setPs({ queue: q });
+  refreshNext();
+  return 'add';
+}
+export function queueMove(id, d) {
+  const q = baseQueue();
+  const i = q.indexOf(id);
+  const j = i + d;
+  const cur = q.indexOf(ps.id);
+  if (i < 0 || j <= cur || j >= q.length) return;
+  [q[i], q[j]] = [q[j], q[i]];
+  userQueued.add(id); // 自分で並べた動画は、見終わっていても流す
+  setPs({ queue: q });
+  refreshNext();
+}
+// つまんで動かした先へ: pos は「いま流している動画の何本あとか」(1 = 次)
+export function queueMoveTo(id, pos) {
+  const q = baseQueue().filter((x) => x !== id);
+  const cur = q.indexOf(ps.id);
+  const at = Math.min(q.length, Math.max(cur + 1, cur + pos));
+  q.splice(at, 0, id);
+  userQueued.add(id);
+  setPs({ queue: q });
+  refreshNext();
+}
+// 「外す」を元に戻す
+export function queueRestore(q, user) {
+  userQueued.clear();
+  for (const u of user || []) userQueued.add(u);
+  setPs({ queue: q });
+  refreshNext();
+}
+export const queueSnapshot = () => ({ q: (ps.queue || []).slice(), user: [...userQueued] });
+export function queueRemove(id) {
+  if (id === ps.id) return;
+  userQueued.delete(id);
+  setPs({ queue: baseQueue().filter((x) => x !== id) });
+  refreshNext();
+}
+export function queueClear() {
+  userQueued.clear();
+  setPs({ queue: ps.id ? [ps.id] : [] });
+  refreshNext();
+}
+export function queueShuffle() {
+  const q = baseQueue();
+  const cur = q.indexOf(ps.id);
+  const rest = q.slice(cur + 1);
+  for (let k = rest.length - 1; k > 0; k--) {
+    const r = Math.floor(Math.random() * (k + 1));
+    [rest[k], rest[r]] = [rest[r], rest[k]];
+  }
+  setPs({ queue: [...q.slice(0, cur + 1), ...rest] });
+  refreshNext();
+}
+export const isUserQueued = (id) => userQueued.has(id);
 
 // ------------------------------------------------------------------ 次の動画
 let nextTimer = 0;
@@ -646,31 +884,71 @@ function clearNext() {
   clearTimeout(nextTimer);
   if (ps.upNext) setPs({ upNext: null });
 }
-export function nextCandidate() {
+// 次に流す動画と、どこから来たか('user' 自分で並べた・リピート / 'list' 一覧の続き / 'related' 関連動画)
+export function nextInfo() {
   const q = ps.queue || [];
   const i = q.indexOf(ps.id);
+  const pr = appState().prefs;
   const prog = appState().progress;
   if (i >= 0) {
-    for (let k = i + 1; k < q.length; k++) if (!prog[q[k]]?.done) return q[k];
+    // キュー全体のリピート: 見終わっていても順に回る
+    if (pr.repeat === 'all' && q.length > 1) {
+      for (let k = 1; k < q.length; k++) {
+        const c = q[(i + k) % q.length];
+        if (c !== ps.id && !noEmbed.has(c)) return { id: c, from: 'user' };
+      }
+    }
+    // 自分でキューに入れた動画は、見たことがあっても流す。一覧から来た動画は、見終わったものを飛ばす
+    for (let k = i + 1; k < q.length; k++) {
+      const c = q[k];
+      if (userQueued.has(c)) return { id: c, from: 'user' }; // 自分で入れた動画は一度は試す
+      if (noEmbed.has(c)) continue;
+      if (!prog[c]?.done) return { id: c, from: 'list' };
+    }
   }
   const rel = videoDetail(ps.id)?.related || [];
-  const r = rel.find((v) => !prog[v.id]?.done && !v.live) || rel[0];
-  return r?.id || '';
+  const r = rel.find((v) => !prog[v.id]?.done && !v.live && !noEmbed.has(v.id)) || rel.find((v) => !noEmbed.has(v.id));
+  return r ? { id: r.id, from: 'related' } : { id: '', from: '' };
+}
+export function nextCandidate() {
+  return nextInfo().id;
 }
 function scheduleNext() {
-  if (!appState().prefs.autoNext) return;
-  const id = nextCandidate();
-  if (!id) return;
-  setPs({ upNext: { id, ms: 6000 } });
+  const n = nextInfo();
+  if (!n.id) return;
+  // 自動再生がオフでも、自分で並べたキューは続けて流す
+  if (n.from !== 'user' && !appState().prefs.autoNext) return;
+  // 自分で並べた曲の間・リピート・小さい窓・画面を見ていないときは、待ちを短く(曲間を空けない)
+  const quick = n.from === 'user' || ps.mode === 'mini' || document.visibilityState === 'hidden';
+  const ms = quick ? 1200 : 6000;
+  setPs({ upNext: { id: n.id, ms } });
   clearTimeout(nextTimer);
   nextTimer = setTimeout(() => {
-    if (ps.upNext?.id === id) playNext();
-  }, 6000);
+    if (ps.upNext?.id === n.id) playNext();
+  }, ms);
 }
+// 小さい窓で次の動画へ進んだときは、再生画面を通らないので、関連動画などをここで取っておく
+function ensureDetail(id) {
+  if (!id || videoDetail(id)) return;
+  fn('video', { id })
+    .then((d) => {
+      rememberDetail(id, d);
+      rememberHits(d.related);
+      if (ps.id === id) mediaMeta();
+    })
+    .catch(() => {});
+}
+let autoNextPending = ''; // 自動で次へ進めようとしている動画
+let autoCame = false; // いまの動画は、自動で次へ進んで来た
 export function playNext() {
   const id = ps.upNext?.id || nextCandidate();
   clearNext();
-  if (id) location.hash = `#/w/${id}`;
+  if (!id) return;
+  autoNextPending = id;
+  if (ps.mode === 'mini' && !ps.fs) {
+    load(id, { keepMini: true });
+    ensureDetail(id);
+  } else location.hash = `#/w/${id}`;
 }
 export function cancelNext() {
   clearNext();
@@ -720,7 +998,14 @@ export const IC = {
   ff: 'M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z',
   rw: 'M11 18V6l-8.5 6 8.5 6zm.5-6 8.5 6V6l-8.5 6z',
   autoplay: 'M8 6.5v11l9-5.5z',
+  drag: 'M3 15h18v-2H3v2zm0 4h18v-2H3v2zm0-8h18V9H3v2zm0-6v2h18V5H3z',
   moon: 'M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 0 1-4.4 2.26 5.403 5.403 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z',
+  repeat: 'M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z',
+  repeatOne: 'M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4zm-4-2V9h-1l-2 1v1h1.5v4H13z',
+  shuffle: 'M10.59 9.17 5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z',
+  queue: 'M15 6H3v2h12V6zm0 4H3v2h12v-2zM3 16h8v-2H3v2zM17 6v8.18c-.31-.11-.65-.18-1-.18-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3V8h3V6h-5z',
+  playNext: 'M3 10h11v2H3zm0-4h11v2H3zm0 8h7v2H3zm13-1v8l6-4z',
+  up: 'M7.41 15.41 12 10.83l4.59 4.58L18 14l-6-6-6 6z',
 };
 
 // 設定の窓(YouTube アプリと同じく、下から出る)
@@ -737,6 +1022,8 @@ function PlayerSheet() {
   const sleepEnd = usePlayer((p) => p.sleepEnd);
   const sleepMin = usePlayer((p) => p.sleepMin);
   const rev = usePlayer((p) => p.rotRev);
+  const repeat = useSyncExternalStore(subscribeApp, () => appState().prefs.repeat || 'off');
+  const chapIdx = usePlayer((p) => p.chapIdx);
   if (!page) return null;
   const done = () => setPage(null);
   return html`<div class=${clsx('sheet-bg pl-sheet', fs && fsRotated() && 'rot', rev && 'rev')} onClick=${done}>
@@ -745,11 +1032,17 @@ function PlayerSheet() {
       ${page === 'main' && html`
         <button class="sheet-i" onClick=${() => setPage('rate')}><${Icon} d=${IC.speed} /><span>再生速度</span><span class="sp"></span><span class="sheet-v">${(rate || 1) === 1 ? '標準' : (rate || 1) + 'x'}</span></button>
         <button class="sheet-i" onClick=${() => { setPref('autoNext', !autoNext); done(); }}><${Icon} d=${IC.autoplay} /><span>自動再生</span><span class="sp"></span><span class="sheet-v">${autoNext ? 'オン' : 'オフ'}</span></button>
+        <button class="sheet-i" onClick=${() => { const n = { off: 'all', all: 'one', one: 'off' }[repeat] || 'all'; setPref('repeat', n); }}><${Icon} d=${repeat === 'one' ? IC.repeatOne : IC.repeat} /><span>リピート</span><span class="sp"></span><span class="sheet-v">${{ off: 'オフ', all: 'キュー全体', one: 'この動画' }[repeat] || 'オフ'}</span></button>
         <button class="sheet-i" onClick=${() => setPage('sleep')}><${Icon} d=${IC.moon} /><span>おやすみタイマー</span><span class="sp"></span><span class="sheet-v">${sleepLeft ? `あと${sleepLeft}分` : sleepEnd ? '動画の終わりまで' : 'オフ'}</span></button>
         <button class="sheet-i" onClick=${() => { restart(); done(); }}><${Icon} d=${IC.restart} /><span>最初から再生</span></button>
         <div class="sheet-i dim"><${Icon} d=${IC.cc} /><span>字幕</span><span class="sp"></span><span class="sheet-v">オフ(いつも)</span></div>
         <button class="sheet-i" onClick=${() => { setPass(true); done(); }}><${Icon} d=${IC.hand} /><span>YouTube の画面を直接さわる<small>広告の「スキップ」を押すときなど</small></span></button>
         <a class="sheet-i" href=${watchUrl(id, time)} target="_blank" rel="noopener" onClick=${() => { try { player?.pauseVideo(); } catch (_) {} done(); }}><${Icon} d=${IC.open} /><span>YouTube で開く(いまの位置から)</span></a>
+      `}
+      ${page === 'chap' && html`
+        <div class="sheet-head"><button class="ib sm" onClick=${done} aria-label="閉じる"><${Icon} d=${IC.close} /></button><b>チャプター</b></div>
+        ${chaptersOf(id).map((c, k) => html`<button key=${k} class=${clsx('sheet-i rate', k === chapIdx && 'sel')} onClick=${() => { seekTo(c.sec); done(); }}>
+          <span class="chk">${k === chapIdx ? '✓' : ''}</span><span class="chap-t">${fmtTime(c.sec)}</span><span>${c.title}</span></button>`)}
       `}
       ${page === 'sleep' && html`
         <div class="sheet-head"><button class="ib sm" onClick=${() => setPage('main')} aria-label="戻る"><${Icon} d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" /></button><b>おやすみタイマー</b></div>
@@ -831,10 +1124,14 @@ function Controls() {
   const sleepLeft = usePlayer((p) => p.sleepLeft);
   const sleepEnd = usePlayer((p) => p.sleepEnd);
   const loadedAt = usePlayer((p) => p.loadedAt);
+  const contentStarted = usePlayer((p) => p.contentStarted);
+  const adOver = usePlayer((p) => p.adOver);
+  const chapIdx = usePlayer((p) => p.chapIdx);
   const sleepWarn = usePlayer((p) => p.sleepWarn);
   const rotRev = usePlayer((p) => p.rotRev);
   const autoNext = useSyncExternalStore(subscribeApp, () => appState().prefs.autoNext);
   const [show, setShow] = useState(true);
+  const [armed, setArmed] = useState(true); // 出した直後の一瞬はボタンを押せなくする(ダブルタップの2回目がボタンに当たらないように)
   const [drag, setDrag] = useState(null);
   const [boost, setBoost] = useState(false);
   const dragRef = useRef(null);
@@ -955,26 +1252,45 @@ function Controls() {
     const x = fsRotated() ? (getPs().rotRev ? (rect.bottom - e.clientY) : (e.clientY - rect.top)) / rect.height : (e.clientX - rect.left) / rect.width;
     const now = Date.now();
     const tr = tapRef.current;
-    if (now - tr.t < 300 && Math.abs(x - tr.x) < 0.25) {
-      clearTimeout(tr.timer);
+    const side = x < 0.4 ? 'l' : x > 0.6 ? 'r' : '';
+    const doSeek = () => {
+      seekBy(side === 'l' ? -10 : 10);
+      setShow(false);
+      clearTimeout(hideRef.current);
+      tr.rip = { side, k: now, n: tr.rip && tr.rip.side === side && now - tr.rip.k < 900 ? tr.rip.n + 10 : 10 };
+      setRipple(tr.rip);
+      setTimeout(() => setRipple((r) => (r?.k === now ? null : r)), 800);
+    };
+    // 早送りの波紋が出ている間は、同じ側を1回たたくごとに10秒ずつ(YouTube と同じ)
+    if (side && tr.rip && tr.rip.side === side && now - tr.rip.k < 900) {
       tr.t = 0;
-      if (x < 0.4 || x > 0.6) {
-        const side = x < 0.4 ? 'l' : 'r';
-        seekBy(side === 'l' ? -10 : 10);
-        setShow(false);
-        setRipple((r) => ({ side, k: now, n: r && r.side === side && now - r.k < 900 ? r.n + 10 : 10 }));
-        setTimeout(() => setRipple((r) => (r?.k === now ? null : r)), 800);
+      return doSeek();
+    }
+    if (now - tr.t < 300 && Math.abs(x - tr.x) < 0.25) {
+      tr.t = 0;
+      clearTimeout(tr.armT);
+      setArmed(true);
+      if (side) {
+        if (tr.toggled) setShow(tr.prevShow); // 1回目で切りかえた表示を元に戻してから
+        doSeek();
       }
       return;
     }
     tr.t = now;
     tr.x = x;
-    tr.timer = setTimeout(() => {
-      if (show) {
-        setShow(false);
-        clearTimeout(hideRef.current);
-      } else poke();
-    }, 300);
+    // 操作ボタンの出し入れは、待たずにすぐ(2回目が来たら元に戻す)
+    tr.prevShow = show;
+    tr.toggled = true;
+    clearTimeout(tr.armT);
+    if (show) {
+      setArmed(true);
+      setShow(false);
+      clearTimeout(hideRef.current);
+    } else {
+      setArmed(false);
+      tr.armT = setTimeout(() => setArmed(true), 320);
+      poke();
+    }
   };
 
   if (pass) {
@@ -991,9 +1307,9 @@ function Controls() {
   const nextInfo = upNext ? videoInfo(upNext.id) : null;
   const hasNext = !!nextCandidate();
 
-  return html`<div class=${clsx('pc', show && 'on')} onClick=${onTap}
+  return html`<div class=${clsx('pc', show && 'on', !armed && 'unarmed')} onClick=${onTap}
       onPointerDown=${onDown} onPointerMove=${onMove} onPointerUp=${(e) => onUp(e, false)} onPointerCancel=${(e) => onUp(e, true)}>
-    ${ripple && html`<div class=${'pc-ripple ' + ripple.side} key=${ripple.side}>
+    ${ripple && html`<div class=${'pc-ripple ' + ripple.side} key=${ripple.side + ripple.n}>
       <div class="pc-rip-in"><${Icon} d=${ripple.side === 'l' ? IC.rw : IC.ff} size=${26} /><span>${ripple.n} 秒</span></div>
     </div>`}
     ${boost && html`<div class="pc-boost">2x <${Icon} d=${IC.ff} size=${16} /></div>`}
@@ -1001,13 +1317,15 @@ function Controls() {
     ${err &&
     html`<div class="pc-err" onClick=${(e) => e.stopPropagation()}>
       <p>${err}</p>
+      ${upNext && html`<p class="pc-err-next">まもなく次の動画へ進みます</p>`}
       <div class="row">
-        <a class="btn" href=${watchUrl(id, resumePoint(id))} target="_blank" rel="noopener">YouTubeで開く</a>
-        ${hasNext && html`<button class="btn ghost" onClick=${() => playNext()}>次の動画へ</button>`}
+        <a class="btn" href=${watchUrl(id, resumePoint(id))} target="_blank" rel="noopener" onClick=${cancelNext}>YouTubeで開く</a>
+        ${upNext ? html`<button class="btn ghost" onClick=${cancelNext}>キャンセル</button>` : hasNext && html`<button class="btn ghost" onClick=${() => playNext()}>次の動画へ</button>`}
       </div>
     </div>`}
-    ${nextInfo &&
+    ${nextInfo && !err &&
     html`<div class="pc-next" onClick=${(e) => e.stopPropagation()}>
+      <img class="pc-next-th" src=${`https://i.ytimg.com/vi/${upNext.id}/mqdefault.jpg`} alt="" />
       <div class="pc-next-t">次の動画</div>
       <div class="pc-next-title">${nextInfo.title || '次の動画'}</div>
       <div class="row">
@@ -1017,7 +1335,7 @@ function Controls() {
       <div class="pc-next-bar" key=${upNext.id} style=${{ animationDuration: upNext.ms + 'ms' }}></div>
     </div>`}
     <div class="pc-shade"></div>
-    ${!live && Date.now() - loadedAt < 60e3 && html`<button class="pc-chip pc-adskip" onClick=${() => { setPass(true, 15000); toast('15秒だけ YouTube の画面を直接さわれます。広告の「スキップ」を押してください', 3500); }}>広告をスキップ</button>`}
+    ${!live && !contentStarted && !adOver && st !== 2 && html`<button class="pc-chip pc-adskip" onClick=${() => { setPass(true, 15000, true); toast('YouTube の画面を直接さわれます。広告の「スキップ」を押してください(本編が始まると自動で戻ります)', 3500); }}>広告をスキップ</button>`}
     ${sleepWarn && html`<button class="pc-chip pc-sleepwarn" onClick=${() => { setSleep(15); }}><${Icon} d=${IC.moon} size=${14} />まもなく止まります ・ +15分</button>`}
     ${drag != null && html`<div class="pc-seektip">${fmtTime(drag)} <span>/ ${fmtTime(dur)}</span></div>`}
     <div class="pc-top">
@@ -1040,6 +1358,7 @@ function Controls() {
     </div>
     <div class="pc-bottom">
       <div class="pc-time">${live ? html`<span class="live">● ライブ</span>` : html`${fmtTime(shown)} <span class="dur">/ ${fmtTime(dur)}</span>`}</div>
+      ${chapIdx >= 0 && chaptersOf(id)[chapIdx] && html`<button class="pc-chap" onClick=${() => settingsOpen?.('chap')}>・${chaptersOf(id)[chapIdx].title} ›</button>`}
       <span class="sp"></span>
       <button class="pc-ib" aria-label=${fs ? '全画面をやめる' : '全画面'} onClick=${() => (fs ? exitFs() : enterFs())}><${Icon} d=${fs ? IC.fsExit : IC.fs} /></button>
     </div>
@@ -1067,6 +1386,7 @@ function MiniBar() {
       <div class="mini-sub">${info.cht}</div>
     </button>
     <button class="pc-ib dark" aria-label=${playing ? '一時停止' : '再生'} onClick=${togglePlay}><${Icon} d=${playing ? IC.pause : IC.play} size=${26} /></button>
+    <button class=${clsx('pc-ib dark', !nextCandidate() && 'off')} aria-label="次の動画" onClick=${() => { if (nextCandidate()) playNext(); }}><${Icon} d=${IC.next} size=${24} /></button>
     <button class="pc-ib dark" aria-label="閉じる" onClick=${close}><${Icon} d=${IC.close} size=${26} /></button>
     <div class="mini-line" style=${{ width: (dur ? (time / dur) * 100 : 0) + '%' }}></div>
   </div>`;

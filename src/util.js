@@ -120,3 +120,19 @@ export function setThemeBlack(on) {
     m.setAttribute('content', on ? '#000000' : themeOrig.get(m));
   }
 }
+
+// 説明欄の曲目・チャプター(0:00 から始まり、3つ以上あるときだけ)→ [{ sec, title }]
+export function parseChapters(desc) {
+  if (!desc) return [];
+  const out = [];
+  for (const line of String(desc).split('\n')) {
+    const m = line.match(/(^|[\s(\[【「])((?:\d{1,2}:)?\d{1,2}:\d{2})(?![\d:])/);
+    if (!m) continue;
+    const sec = m[2].split(':').map(Number).reduce((a, x) => a * 60 + x, 0);
+    const title = line.replace(m[2], '').replace(/^[\s\-–—・|:：.)\]】」]+|[\s\-–—・|:：(\[【「]+$/g, '').trim();
+    out.push({ sec, title: title || m[2] });
+  }
+  if (out.length < 3 || out[0].sec !== 0) return [];
+  for (let i = 1; i < out.length; i++) if (out[i].sec <= out[i - 1].sec) return [];
+  return out;
+}

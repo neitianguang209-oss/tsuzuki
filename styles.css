@@ -595,3 +595,58 @@ html.wdrag-anim .ph.full, html.wdrag-anim .watch, html.wdrag-anim body[data-rout
 .ph.fs.rot.rev { transform: translate(-50%, -50%) rotate(-90deg); }
 .sheet-bg.pl-sheet.rot.rev { transform: translate(-50%, -50%) rotate(-90deg); }
 body.fs-rot.fs-rot-rev .toast { left: auto; right: 44px; transform: translate(50%, -50%) rotate(-90deg); }
+
+/* ------------------------------------------------------------ v1.6 キュー */
+.qp-bar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.qp-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; }
+.qp-row.now { background: var(--bg2); border-radius: 10px; padding: 6px; margin: 0 -6px; }
+.qp-th { position: relative; width: 112px; flex: none; aspect-ratio: 16 / 9; border-radius: 8px; overflow: hidden; background: var(--bg2); cursor: pointer; }
+.qp-th img { width: 100%; height: 100%; object-fit: cover; }
+.qp-now { position: absolute; left: 4px; bottom: 4px; background: var(--red); color: #fff; font-size: 11px; font-weight: 700; padding: 1px 6px; border-radius: 4px; }
+.qp-body { flex: 1; min-width: 0; cursor: pointer; }
+.qp-title { font-size: 14px; font-weight: 500; line-height: 19px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.qp-sub { color: var(--fg2); font-size: 12px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qp-ops { display: flex; flex: none; }
+.qp-ops .ib:disabled { opacity: 0.3; }
+.qp-foot { margin-top: 12px; }
+
+/* ------------------------------------------------------------ v1.6 仕上げ */
+/* キュー: つまんで並べ替え・見終わりの印・元に戻す */
+.qp-ops { gap: 2px; align-items: center; }
+.qp-ops .ib.sm { width: 40px; height: 40px; }
+.qp-grip { width: 40px; height: 40px; display: grid; place-items: center; color: var(--fg2); touch-action: none; cursor: grab; }
+.qp-row.dragging { position: relative; z-index: 2; background: var(--bg2); border-radius: 10px; box-shadow: var(--shadow); opacity: 0.95; }
+.qp-row.skip .qp-th, .qp-row.skip .qp-title { opacity: 0.5; }
+.qp-undo { display: flex; align-items: center; gap: 10px; justify-content: space-between; padding: 8px 12px; margin-bottom: 8px; border-radius: 10px; background: var(--bg2); font-size: 13px; }
+/* 再生画面の「次の動画」の帯 */
+.w-upnext { display: flex; align-items: center; gap: 10px; width: 100%; margin: 12px 0 0; padding: 8px; border-radius: 12px; background: var(--bg2); text-align: left; }
+.w-upnext img { width: 88px; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 6px; flex: none; }
+.w-upnext-b { flex: 1; min-width: 0; display: grid; }
+.w-upnext-l { color: var(--fg2); font-size: 12px; }
+.w-upnext-t { font-size: 14px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 次の動画の重ね表示にサムネイル・流せない動画の案内 */
+.pc-next-th { width: 128px; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 8px; }
+.pc-err-next { color: #ccc; font-size: 13px; }
+/* チャプター(曲目) */
+.pc-chap { margin-left: 6px; max-width: 46%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #fff; font-size: 12px; font-weight: 500; text-shadow: 0 1px 2px rgba(0,0,0,.5); }
+.chap-t { color: var(--fg2); font-variant-numeric: tabular-nums; min-width: 44px; }
+/* 小さい窓の「次へ」 */
+.mini-body .pc-ib.off { opacity: 0.3; }
+.mini-body .pc-ib { width: 40px; }
+/* 押したときの手ごたえ(指でさわる端末だけ) */
+@media (hover: none) {
+  .vb .th, .vr, .vsh, .sc, .w-upnext { transition: filter 0.08s 0.04s, transform 0.08s 0.04s; }
+  .vb:active .th, .vsh:active .th, .sc:active, .vr:active .th { filter: brightness(0.85); transform: scale(0.985); }
+  .chip:active, .pill:active, .btn:active, .w-upnext:active { filter: brightness(0.88); }
+  .tab:active svg { transform: scale(0.9); }
+  .pc-ib:active { background: rgba(255, 255, 255, 0.18); }
+  .pc-ib.dark:active { background: var(--bg2); }
+}
+/* 小さいボタン(⋮)は、押せる範囲を見た目より広く */
+.more { position: relative; }
+.more::before { content: ''; position: absolute; inset: -8px; }
+/* 左端からなぞって戻るときの影 */
+body.edgeback .main { box-shadow: -12px 0 24px rgba(0,0,0,.25); }
+
+/* 操作ボタンを出した直後の一瞬は押せない(ダブルタップの2回目がボタンに当たらないように) */
+.pc.unarmed .pc-top *, .pc.unarmed .pc-mid *, .pc.unarmed .pc-bottom *, .pc.unarmed .pc-seek * { pointer-events: none !important; }
