@@ -650,3 +650,24 @@ body.edgeback .main { box-shadow: -12px 0 24px rgba(0,0,0,.25); }
 
 /* 操作ボタンを出した直後の一瞬は押せない(ダブルタップの2回目がボタンに当たらないように) */
 .pc.unarmed .pc-top *, .pc.unarmed .pc-mid *, .pc.unarmed .pc-bottom *, .pc.unarmed .pc-seek * { pointer-events: none !important; }
+
+/* ------------------------------------------------------------ v1.6.1 全画面の動画の位置 */
+/* 横向きの全画面: 動画の箱は 16:9 にして、画面のまん中に置く。
+   左右は「切り欠き側」と「反対側」で同じだけよける(片側だけよけると動画が右か左に寄るため)。
+   箱からはみ出した分は切らずに縮めて収める(箱の外は黒)。 */
+.ph.fs { container-type: size; }
+.ph.fs .ph-video { overflow: hidden; }
+@supports (width: 1cqw) {
+  .ph.fs:not(.rot) .ph-video {
+    --sx: max(env(safe-area-inset-left, 0px), env(safe-area-inset-right, 0px));
+    inset: auto; left: 50%; top: 50%; translate: -50% -50%;
+    width: min(calc(100cqw - 2 * var(--sx)), calc(100cqh * 16 / 9));
+    height: min(100cqh, calc((100cqw - 2 * var(--sx)) * 9 / 16));
+  }
+  .ph.fs.rot .ph-video {
+    inset: auto; left: 50%; top: 50%; translate: -50% -50%;
+    width: min(100cqw, calc(100cqh * 16 / 9));
+    height: min(100cqh, calc(100cqw * 9 / 16));
+  }
+}
+.ph.fs:not(.rot) .pc-adskip { left: 12px; top: 56px; }

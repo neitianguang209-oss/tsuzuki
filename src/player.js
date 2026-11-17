@@ -105,8 +105,36 @@ let lastSaved = 0;
 let captionsOffFor = '';
 
 export function attachHost(el) {
+  hostRO?.disconnect();
   hostEl = el;
+  if (el && window.ResizeObserver) {
+    hostRO = new ResizeObserver(() => refit());
+    hostRO.observe(el);
+  }
 }
+// 動画の枠(iframe)の大きさを、箱の実際の大きさ(px)にそろえる。
+// iPhone は画面を回した直後、埋め込みの中身が古い幅のまま計算して、動画が右にずれたり端が切れたりする。
+// px で書き直すと中身も計算し直されるので、回したあと何回か時間をおいてそろえ直す。
+let hostRO = null;
+function refit() {
+  const f = hostEl?.querySelector('iframe');
+  if (!f) return;
+  const w = Math.round(hostEl.clientWidth);
+  const h = Math.round(hostEl.clientHeight);
+  if (!w || !h) return;
+  if (f.style.width !== w + 'px') f.style.width = w + 'px';
+  if (f.style.height !== h + 'px') f.style.height = h + 'px';
+  try { player?.setSize?.(w, h); } catch (_) { /* まだ準備中 */ }
+}
+let refitTimers = [];
+function refitSoon() {
+  refitTimers.forEach(clearTimeout);
+  refitTimers = [0, 120, 400, 900].map((ms) => setTimeout(refit, ms));
+}
+addEventListener('resize', refitSoon);
+addEventListener('orientationchange', refitSoon);
+try { screen.orientation?.addEventListener?.('change', refitSoon); } catch (_) { /* 古いブラウザ */ }
+try { visualViewport?.addEventListener?.('resize', refitSoon); } catch (_) { /* 同上 */ }
 
 function noCaptions() {
   // 字幕を出さない: 字幕の仕組みそのものを外す(動画やアカウントの設定で自動表示になっていても消える)
@@ -170,6 +198,7 @@ function create() {
       },
       events: {
         onReady: () => {
+          refitSoon();
           setPs({ ready: true });
           noCaptions();
           try { player.setPlaybackRate(appState().prefs.rate || 1); } catch (_) { /* 速さを変えられない動画 */ }
@@ -562,6 +591,7 @@ export function seekWhenReady(id, sec) {
 let fsTipShown = false;
 export function enterFs(fromRotate = false) {
   setPs({ fs: true });
+  refitSoon();
   const el = document.documentElement;
   const can = !!el.requestFullscreen && !fromRotate;
   try {
@@ -583,6 +613,7 @@ export function enterFs(fromRotate = false) {
 }
 export function exitFs() {
   setPs({ fs: false });
+  refitSoon();
   try {
     screen.orientation?.unlock?.();
   } catch (_) { /* 何もしない */ }
